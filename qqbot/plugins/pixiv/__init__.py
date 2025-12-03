@@ -4,33 +4,39 @@ import urllib.parse
 import random
 import time
 import os
-import tempfile
 import aiofiles
-from nonebot import on_command, logger
+from nonebot import on_command, logger, get_driver
 from nonebot.adapters.onebot.v11 import MessageSegment, Bot, Event
 from typing import Dict, Any
 import asyncio
 import ssl
 import traceback
 from pathlib import Path
-from datetime import datetime, timezone, timedelta  # 新增时区相关导入
+from datetime import datetime, timezone, timedelta
 
 # ====== 重要配置（必须修改） ======
-PROXY = "http://127.0.0.1:7890"  # 本地代理地址
-USE_PROXY = True
+# 从环境变量获取配置
+env = get_driver().config
 
-PROXY_URL = "https://quiet-hill-31f3.math89423.workers.dev/"  # Cloudflare Workers地址
+# 优先使用环境变量，其次使用默认值
+PROXY = getattr(env, "PROXY_ADDRESS", "http://127.0.0.1:7890")  # 本地代理地址
+USE_PROXY = getattr(env, "USE_PROXY", True)  # 是否使用代理
+PROXY_URL = getattr(env, "CF_WORKER_URL", "https://quiet-hill-31f3.math89423.workers.dev/")  # Cloudflare Workers地址
+PIXIV_COOKIE = getattr(env, "PIXIV_COOKIE", "PHPSESSID=14916444_EuNtNE3Yd2ZZ50A7UzivUlxP7O2hLP7s; device_token=ccd49454e972c3b547f1db56a3560575; p_ab_id=1; p_ab_id_2=1")
 
-PIXIV_COOKIE = "PHPSESSID=14916444_EuNtNE3Yd2ZZ50A7UzivUlxP7O2hLP7s; device_token=ccd49454e972c3b547f1db56a3560575; p_ab_id=1; p_ab_id_2=1"  # ← 必须修改！
+# 基础项目目录
+BASE_DIR = Path(__file__).parent.parent.parent.absolute()
+DATA_DIR = BASE_DIR / "data"
+TEMP_DIR = DATA_DIR / "pixiv_temp"  # 专用临时目录
+
+# 创建目录
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # 原图发送专用配置
 MAX_DOWNLOAD_CHUNK = 8192  # 8KB分块下载
 DOWNLOAD_TIMEOUT = 60  # 60秒超时
 MAX_ATTEMPTS = 2  # 重试次数
-TEMP_DIR = tempfile.gettempdir()  # 系统临时目录
-
-# 创建专用临时目录
-os.makedirs(os.path.join(TEMP_DIR, "pixiv_bot"), exist_ok=True)
 
 # ====== 新增：近期图片缓存排除机制 ======
 RECENT_IMAGES = {}  # {pid: last_used_time}
@@ -348,25 +354,27 @@ async def get_remote_file_size(url: str) -> int:
         logger.warning(f"获取文件大小失败: {str(e)}")
         return 0
 
-async def download_original_image(url: str) -> str:
+async def download_original_image(url: str) -> Path:
     """安全下载大文件到临时位置，返回文件路径"""
     file_size = await get_remote_file_size(url)
-    if file_size > 50 * 1024 * 1024:  # 超过50MB警告
+    if file_size > 10 * 1024 * 1024:  # 超过10MB警告
         logger.warning(f"⚠️ 检测到超大文件 ({file_size/1024/1024:.1f}MB)，可能发送失败")
     
     # 生成唯一文件名
     timestamp = int(time.time() * 1000)
     random_str = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
-    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1] or '.jpg'
+    parsed_url = urllib.parse.urlparse(url)
+    ext = os.path.splitext(parsed_url.path)[1] or '.jpg'
     
     # 确保文件扩展名兼容
-    if ext.lower() in ['.webp', '.avif', '.heic']:
+    ext = ext.lower()
+    if ext in ['.webp', '.avif', '.heic']:
         ext = '.jpg'
-    elif ext.lower() == '.svg':
+    elif ext == '.svg':
         ext = '.png'
     
     filename = f"pixiv_{timestamp}_{random_str}{ext}"
-    temp_path = os.path.join(TEMP_DIR, "pixiv_bot", filename)
+    temp_path = TEMP_DIR / filename
     
     logger.info(f"开始下载原图到: {temp_path} (预估大小: {file_size/1024/1024:.2f}MB)")
     
@@ -411,7 +419,7 @@ async def download_original_image(url: str) -> str:
                                 logger.info(f"下载进度: {total_bytes/1024/1024:.1f}MB, 速度: {speed:.2f}MB/s")
                     
                     # 验证文件完整性
-                    downloaded_size = os.path.getsize(temp_path)
+                    downloaded_size = temp_path.stat().st_size
                     if file_size > 0 and downloaded_size < file_size * 0.9:  # 允许10%误差
                         raise Exception(f"文件不完整: 期望 {file_size} 字节, 实际 {downloaded_size} 字节")
                     
@@ -425,9 +433,9 @@ async def download_original_image(url: str) -> str:
                     except Exception as e:
                         logger.warning(f"图片验证失败，尝试修复: {str(e)}")
                         # 尝试修复：重命名扩展名
-                        if not temp_path.endswith(('.jpg', '.jpeg', '.png')):
-                            new_path = temp_path.rsplit('.', 1)[0] + '.jpg'
-                            os.rename(temp_path, new_path)
+                        if not str(temp_path).endswith(('.jpg', '.jpeg', '.png')):
+                            new_path = temp_path.with_suffix('.jpg')
+                            temp_path.rename(new_path)
                             temp_path = new_path
                     
                     logger.info(f"✅ 原图下载成功: {downloaded_size/1024/1024:.2f}MB, 耗时: {time.time()-start_time:.1f}s")
@@ -445,18 +453,16 @@ async def cleanup_temp_files():
     """清理24小时以上的临时文件"""
     try:
         now = time.time()
-        temp_dir = os.path.join(TEMP_DIR, "pixiv_bot")
         
-        for filename in os.listdir(temp_dir):
-            file_path = os.path.join(temp_dir, filename)
-            if os.path.isfile(file_path):
-                file_age = now - os.path.getmtime(file_path)
+        for file_path in TEMP_DIR.glob("*"):
+            if file_path.is_file():
+                file_age = now - file_path.stat().st_mtime
                 if file_age > 24 * 3600:  # 24小时
                     try:
-                        os.remove(file_path)
-                        logger.debug(f"清理旧临时文件: {filename}")
+                        file_path.unlink()
+                        logger.debug(f"清理旧临时文件: {file_path.name}")
                     except Exception as e:
-                        logger.warning(f"清理文件失败 {filename}: {str(e)}")
+                        logger.warning(f"清理文件失败 {file_path.name}: {str(e)}")
     except Exception as e:
         logger.warning(f"清理临时文件时出错: {str(e)}")
 
@@ -467,8 +473,8 @@ pixiv_cmd = on_command("pixiv", aliases={"p"}, priority=5, block=True)
 async def handle_pixiv_command(bot: Bot, event: Event):
     """处理 /pixiv 命令 - 原图优先模式"""
     raw_message = str(event.get_message()).strip()
-    command_length = len("/pixiv")
-    args = raw_message[command_length:].strip()
+    command_str = event.get_plaintext().split()[0]
+    args = raw_message[len(command_str):].strip()
     
     if not args:
         await bot.send(event, "请提供搜索标签，例如：\n/pixiv 鸣潮\n/p 鸣潮")
@@ -499,32 +505,41 @@ async def handle_pixiv_command(bot: Bot, event: Event):
             await cleanup_temp_files()
             
             # 下载原图
-            temp_path = await download_original_image(result['image_url'])
+            file_path = await download_original_image(result['image_url'])
             
-            # 4. 构建正确的CQ码 - 使用file协议
-            # 确保路径格式正确（Windows需要三个斜杠，Linux/Mac需要两个）
-            if os.name == 'nt':  # Windows
-                file_url = f"file:///{temp_path.replace(os.sep, '/')}"
-            else:  # Linux/Mac
-                file_url = f"file://{temp_path}"
+            # ===== 关键修复：验证文件存在且可读 =====
+            if not file_path.exists():
+                raise FileNotFoundError(f"文件不存在: {file_path}")
             
-            # 5. 发送原图 - 使用MessageSegment确保正确解析
+            file_size = file_path.stat().st_size
+            if file_size == 0:
+                raise ValueError(f"文件为空: {file_path}")
+            
+            logger.info(f"文件验证通过，大小: {file_size/1024/1024:.2f}MB")
+            logger.info(f"准备发送文件路径: {file_path}")
+            
+            # ===== 关键修复：直接使用文件路径（不是file:// URL） =====
             start_time = time.time()
-            await bot.send(event, MessageSegment.image(file_url))
+            
+            # # 方法1：直接传递文件路径
+            # await bot.send(event, MessageSegment.image(str(file_path.resolve())))
+            
+            # 如果方法1失败，可以尝试方法2：读取文件内容
+            async with aiofiles.open(file_path, 'rb') as f:
+                image_data = await f.read()
+            await bot.send(event, MessageSegment.image(image_data))
+            
             logger.info(f"✅ 原图发送成功! 耗时: {time.time()-start_time:.1f}s")
             
-            # 6. 异步清理文件（不阻塞响应）
-            async def delayed_cleanup():
-                await asyncio.sleep(30)  # 等待30秒确保发送完成
-                try:
-                    if os.path.exists(temp_path):
-                        os.remove(temp_path)
-                        logger.debug(f"已清理临时文件: {temp_path}")
-                except Exception as e:
-                    logger.warning(f"清理文件失败 {temp_path}: {str(e)}")
-            
-            # 创建后台任务
-            asyncio.create_task(delayed_cleanup())
+            # 4. 同步清理文件（确保发送完成后再删除）
+            try:
+                # 等待一小段时间确保消息完全发送
+                await asyncio.sleep(1)
+                if file_path.exists():
+                    file_path.unlink()
+                    logger.debug(f"✅ 已清理临时文件: {file_path}")
+            except Exception as e:
+                logger.warning(f"清理文件警告 {file_path}: {str(e)}")
             
         except Exception as e:
             error_msg = str(e)
@@ -553,11 +568,11 @@ async def handle_pixiv_command(bot: Bot, event: Event):
                 "1. 登录 https://www.pixiv.net\n"
                 "2. 按 F12 打开开发者工具\n"
                 "3. 进入 Application → Storage → Cookies\n"
-                "4. 复制整个 Cookie 内容替换代码中的 PIXIV_COOKIE"
+                "4. 复制整个 Cookie 内容"
             )
         elif "代理" in error_msg or "proxy" in error_msg.lower() or "Proxy" in error_msg:
             error_msg = (
-                "⚠️ 代理配置问题！请检查:\n"
+                f"⚠️ 代理配置问题！请检查:\n"
                 f"- 本地代理: {PROXY}\n"
                 f"- Cloudflare 代理: {PROXY_URL}\n"
                 "- 确保代理软件正常运行"
@@ -566,7 +581,7 @@ async def handle_pixiv_command(bot: Bot, event: Event):
             error_msg = (
                 "⚠️ 请求超时！可能是网络不稳定或代理延迟过高\n"
                 "建议:\n"
-                "1. 检查Clash代理是否正常运行\n"
+                "1. 检查代理是否正常运行\n"
                 "2. 尝试更换标签\n"
                 "3. 检查Cloudflare Workers是否可用"
             )
@@ -579,8 +594,7 @@ async def handle_pixiv_command(bot: Bot, event: Event):
         elif "404" in error_msg or "403" in error_msg:
             error_msg = (
                 "⚠️ 无法访问图片资源\n"
-                "可能是代理配置有误或Pixiv限制\n"
-                f"原始URL: {result.get('original_url', '未知') if 'result' in locals() else '未知'}"
+                "可能是代理配置有误或Pixiv限制"
             )
         else:
             error_msg = f"发生未知错误: {error_msg}"
