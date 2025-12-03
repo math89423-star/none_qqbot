@@ -34,26 +34,40 @@ os.makedirs(os.path.join(TEMP_DIR, "pixiv_bot"), exist_ok=True)
 # ====== 核心函数 ======
 async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     """
-    通过角色标签搜索Pixiv图片（优化重复率）
+    通过角色标签搜索Pixiv图片（优化重复率，添加R-18过滤，按热度排序且限制近一周）
     """
     search_tag = " ".join(tags)
     encoded_tag = urllib.parse.quote(search_tag)
     
-    # ===== 关键优化1：随机偏移起始位置 =====
-    # 不再固定取第一页前10张，而是随机偏移30-100个作品位置
-    offset = random.randint(30, 100)  # 随机偏移量
-    page = offset // 60 + 1  # 每页60作品，计算页码
-    start_index = offset % 60  # 该页内的起始位置
+    # ===== 关键修改1：检查是否明确请求R-18内容 =====
+    is_explicit_r18_request = any(tag.lower() in ["r-18", "r18", "r-18g", "r18g"] for tag in tags)
+    
+    # ===== 关键修改2：设置安全模式参数 =====
+    search_mode = "all" if is_explicit_r18_request else "safe"
+    
+    # ===== 关键优化：按热度排序 + 近一周时间范围 =====
+    # 计算近一周的日期范围 (格式: YYYY-MM-DD)
+    from datetime import datetime, timedelta
+    end_date = datetime.now().strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    
+    # 随机偏移起始位置
+    offset = random.randint(10, 50)  # 热门作品集中在前几页，减少偏移量
+    page = offset // 60 + 1
+    start_index = offset % 60
     
     url = f"https://www.pixiv.net/ajax/search/artworks/{encoded_tag}"
     params = {
         "word": search_tag,
-        "order": "date_d",
-        "mode": "all",
-        "p": page,  # 使用计算出的随机页码
+        "order": "popular_d",  # 改为按热度降序排列
+        "mode": search_mode,   # 使用安全模式参数
+        "p": page,
         "s_mode": "s_tag",
         "type": "all",
-        "lang": "zh"
+        "lang": "zh",
+        "scd": start_date,     # 开始日期 (近一周)
+        "ecd": end_date,       # 结束日期 (今天)
+        "blt": "200"           # 最低收藏数 (过滤低质量作品)
     }
     
     headers = {
@@ -71,7 +85,6 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
         proxy = PROXY if USE_PROXY else None
         
         async with aiohttp.ClientSession() as session:
-            # 1. 搜索作品（带随机偏移）
             async with session.get(url, headers=headers, params=params, proxy=proxy, timeout=30) as response:
                 if response.status != 200:
                     error_text = await response.text()
@@ -87,34 +100,64 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 if not data.get("body") or not data["body"].get("illustManga"):
                     raise Exception("API返回空数据，可能标签无效或Cookie失效")
                 
-                # ===== 关键优化2：扩大候选池 ====
-                # 获取整页作品（60张），而非仅前10张
+                # 获取整页作品（60张）
                 all_results = [
                     item for item in data["body"]["illustManga"]["data"] 
                     if item and isinstance(item, dict) and "id" in item and item.get("isAdContainer", 0) == 0
                 ]
                 
-                # 从偏移位置开始取20张候选（避免取到太旧的作品）
-                candidates = all_results[start_index:start_index+20]
+                # ===== R-18内容过滤 =====
+                filtered_results = []
+                for item in all_results:
+                    # 获取作品标签（安全访问）
+                    tags_info = item.get("tags", [])
+                    if isinstance(tags_info, dict):
+                        tags_info = tags_info.get("tags", [])
+                    
+                    # 提取标签名称
+                    tag_names = [tag.get("tag", "").lower() for tag in tags_info if isinstance(tag, dict)]
+                    
+                    # 检查R-18/R-18G标签
+                    is_r18 = any("r-18" in tag or "r18" in tag for tag in tag_names)
+                    is_r18g = any("r-18g" in tag or "r18g" in tag for tag in tag_names)
+                    
+                    # 仅保留符合条件的作品
+                    if is_explicit_r18_request or (not is_r18 and not is_r18g):
+                        filtered_results.append(item)
                 
-                if not candidates:
-                    # 候选不足时回退到前30张
-                    candidates = all_results[:30]
+                # 结果不足时的处理
+                if not filtered_results:
+                    if not is_explicit_r18_request:
+                        raise Exception("未找到适合的内容。如果您想搜索成人内容，请在标签中包含'R-18'或'R-18G'")
+                    else:
+                        raise Exception("未找到匹配的作品，请尝试其他标签或检查Cookie是否有效")
+                
+                # 选择候选作品（只取前30个高质量作品）
+                candidates = filtered_results[:30]
                 
                 if not candidates:
                     raise Exception("未找到有效作品，请尝试其他标签或检查Cookie是否有效")
                 
-                # ===== 关键优化3：加权随机选择 ====
-                # 根据作品受欢迎程度加权（收藏数+浏览数），避免总是选最新作品
+                # ===== 优化：根据综合质量评分加权选择 =====
                 weighted_candidates = []
                 for item in candidates:
-                    # 获取作品统计信息（安全访问）
-                    stats = item.get("bookmarkCount", 0) + item.get("likeCount", 0) * 0.5
-                    # 保证至少1权重防止除零
-                    weight = max(1, int(stats ** 0.5))  # 开方平滑权重
+                    # 获取作品质量指标
+                    bookmark_count = item.get("bookmarkCount", 0)  # 收藏数
+                    like_count = item.get("likeCount", 0)          # 点赞数
+                    view_count = item.get("viewCount", 0)          # 浏览数
+                    
+                    # 计算综合质量分数 (收藏权重最高，其次是点赞)
+                    quality_score = (
+                        bookmark_count * 10 + 
+                        like_count * 5 + 
+                        view_count * 0.1
+                    )
+                    
+                    # 保证至少1权重
+                    weight = max(1, min(100, int(quality_score ** 0.5)))  # 开方平滑
                     weighted_candidates.extend([item] * weight)
                 
-                # 随机选择（热门作品概率更高，但冷门也有机会）
+                # 随机选择（高分作品概率更高）
                 selected = random.choice(weighted_candidates)
                 illust_id = selected["id"]
                 
@@ -135,10 +178,22 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                         raise Exception(f"作品详情API错误: {illust_data['message']}")
                     
                     illust_body = illust_data["body"]
+                    
+                    # 再次检查R-18标签
+                    work_tags = [tag.get("tag", "") for tag in illust_body.get("tags", {}).get("tags", [])]
+                    is_work_r18 = any(tag.lower() in ["r-18", "r18"] for tag in work_tags)
+                    is_work_r18g = any(tag.lower() in ["r-18g", "r18g"] for tag in work_tags)
+                    
+                    # 如果不是明确请求R-18且作品包含R-18标签，重新搜索
+                    if not is_explicit_r18_request and (is_work_r18 or is_work_r18g):
+                        logger.warning(f"检测到R-18内容但未明确请求，跳过作品ID: {illust_id}")
+                        # 为避免无限递归，不在此处递归，而是抛出异常让用户重试
+                        raise Exception("检测到不适当内容，已跳过。请尝试其他标签。")
+                    
                     original_img_url = illust_body["urls"]["original"]
                     regular_img_url = illust_body["urls"]["regular"]
                     
-                    # 3. 构建代理后的图片URL
+                    # 构建代理后的图片URL
                     proxy_original_url = replace_image_domain(original_img_url)
                     proxy_preview_url = replace_image_domain(regular_img_url)
                     
@@ -150,12 +205,16 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                         "author_id": illust_body["userId"],
                         "work_url": f"https://www.pixiv.net/artworks/{illust_id}",
                         "preview_url": proxy_preview_url,
-                        "original_url": original_img_url  # 保留原始URL用于调试
+                        "original_url": original_img_url,
+                        "stats": {
+                            "bookmarks": bookmark_count,
+                            "likes": like_count,
+                            "views": view_count
+                        }
                     }
                 
     except Exception as e:
         raise Exception(f"搜索失败: {str(e)}")
-
 
 def replace_image_domain(url: str) -> str:
     """将Pixiv图片域名替换为代理域名，并确保文件格式兼容"""
