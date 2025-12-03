@@ -13,6 +13,7 @@ import asyncio
 import ssl
 import traceback
 from pathlib import Path
+from datetime import datetime, timezone, timedelta  # 新增时区相关导入
 
 # ====== 重要配置（必须修改） ======
 PROXY = "http://127.0.0.1:7890"  # 本地代理地址
@@ -31,6 +32,10 @@ TEMP_DIR = tempfile.gettempdir()  # 系统临时目录
 # 创建专用临时目录
 os.makedirs(os.path.join(TEMP_DIR, "pixiv_bot"), exist_ok=True)
 
+# ====== 新增：近期图片缓存排除机制 ======
+RECENT_IMAGES = {}  # {pid: last_used_time}
+EXCLUDE_DURATION = 3600  # 1小时内不重复使用同一作品
+
 # ====== 核心函数 ======
 async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     """
@@ -47,19 +52,19 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     
     # ===== 关键优化：按热度排序 + 近一周时间范围 =====
     # 计算近一周的日期范围 (格式: YYYY-MM-DD)
-    from datetime import datetime, timedelta
     end_date = datetime.now().strftime("%Y-%m-%d")
     start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
     
-    # 随机偏移起始位置
-    offset = random.randint(10, 50)  # 热门作品集中在前几页，减少偏移量
-    page = offset // 60 + 1
+    # ===== 关键修改3：扩大随机偏移量范围 =====
+    # 覆盖3页(180张)作品，显著增加多样性
+    offset = random.randint(0, 180)
+    page = max(1, offset // 60 + 1)  # 确保page至少为1
     start_index = offset % 60
     
     url = f"https://www.pixiv.net/ajax/search/artworks/{encoded_tag}"
     params = {
         "word": search_tag,
-        "order": "popular_d",  # 改为按热度降序排列
+        "order": "popular_d",  # 按热度降序排列
         "mode": search_mode,   # 使用安全模式参数
         "p": page,
         "s_mode": "s_tag",
@@ -132,34 +137,89 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                     else:
                         raise Exception("未找到匹配的作品，请尝试其他标签或检查Cookie是否有效")
                 
-                # 选择候选作品（只取前30个高质量作品）
-                candidates = filtered_results[:30]
+                # ===== 关键修改4：重构选择逻辑（质量+新鲜度综合评分）=====
+                scored_candidates = []
+                current_time = datetime.now(timezone.utc)
                 
-                if not candidates:
-                    raise Exception("未找到有效作品，请尝试其他标签或检查Cookie是否有效")
-                
-                # ===== 优化：根据综合质量评分加权选择 =====
-                weighted_candidates = []
-                for item in candidates:
+                for item in filtered_results:
                     # 获取作品质量指标
                     bookmark_count = item.get("bookmarkCount", 0)  # 收藏数
                     like_count = item.get("likeCount", 0)          # 点赞数
                     view_count = item.get("viewCount", 0)          # 浏览数
                     
-                    # 计算综合质量分数 (收藏权重最高，其次是点赞)
+                    # 计算基础质量分数（降低权重放大效应）
                     quality_score = (
-                        bookmark_count * 10 + 
-                        like_count * 5 + 
-                        view_count * 0.1
+                        bookmark_count * 3 + 
+                        like_count * 2 + 
+                        view_count * 0.05
                     )
                     
-                    # 保证至少1权重
-                    weight = max(1, min(100, int(quality_score ** 0.5)))  # 开方平滑
-                    weighted_candidates.extend([item] * weight)
+                    # 添加新鲜度因子（近7天作品优先）
+                    create_date = item.get("createDate", "")
+                    if create_date:
+                        try:
+                            # 处理不同格式的日期
+                            if "T" in create_date:
+                                create_time = datetime.strptime(create_date.split("T")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                            else:
+                                create_time = datetime.strptime(create_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                            
+                            days_old = (current_time - create_time).days
+                            # 7天内新作品有加成，越新权重越高
+                            freshness_factor = max(0.5, 1 - (days_old / 7))
+                            quality_score *= freshness_factor
+                        except Exception as date_error:
+                            logger.debug(f"日期解析失败: {date_error}")
+                    
+                    scored_candidates.append((quality_score, item))
                 
-                # 随机选择（高分作品概率更高）
-                selected = random.choice(weighted_candidates)
+                # 按质量分数排序（降序）
+                scored_candidates.sort(key=lambda x: x[0], reverse=True)
+                
+                # 仅取前50个高质量作品
+                candidates = [item for _, item in scored_candidates[:50]]
+                
+                if not candidates:
+                    raise Exception("未找到有效作品，请尝试其他标签或检查Cookie是否有效")
+                
+                # ===== 关键修改5：智能选择策略（70%高质量/30%随机）=====
+                if random.random() < 0.7:
+                    # 70%概率从高质量区选择（前30%）
+                    high_quality_pool = candidates[:max(1, len(candidates) // 3)]
+                    selected = random.choice(high_quality_pool)
+                else:
+                    # 30%概率完全随机（保证多样性）
+                    selected = random.choice(candidates)
+                
                 illust_id = selected["id"]
+                
+                # ===== 新增：近期图片排除机制 =====
+                current_timestamp = time.time()
+                # 清理过期缓存
+                for pid, timestamp in list(RECENT_IMAGES.items()):
+                    if current_timestamp - timestamp > EXCLUDE_DURATION:
+                        del RECENT_IMAGES[pid]
+                
+                # 检查是否近期使用过
+                retry_count = 0
+                while str(illust_id) in RECENT_IMAGES and retry_count < 5:
+                    retry_count += 1
+                    if len(candidates) <= 1:
+                        break
+                    # 从未使用过的作品中重新选择
+                    unused_candidates = [item for item in candidates if str(item["id"]) not in RECENT_IMAGES]
+                    if unused_candidates:
+                        selected = random.choice(unused_candidates)
+                        illust_id = selected["id"]
+                    else:
+                        # 所有候选作品近期都用过，选择最久未用的
+                        oldest_pid = min(RECENT_IMAGES.items(), key=lambda x: x[1])[0]
+                        selected = next((item for item in candidates if str(item["id"]) == oldest_pid), selected)
+                        illust_id = selected["id"]
+                        break
+                
+                # 记录当前使用的作品
+                RECENT_IMAGES[str(illust_id)] = current_timestamp
                 
                 # 2. 获取作品详情
                 illust_url = f"https://www.pixiv.net/ajax/illust/{illust_id}"
@@ -207,9 +267,9 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                         "preview_url": proxy_preview_url,
                         "original_url": original_img_url,
                         "stats": {
-                            "bookmarks": bookmark_count,
-                            "likes": like_count,
-                            "views": view_count
+                            "bookmarks": selected.get("bookmarkCount", 0),
+                            "likes": selected.get("likeCount", 0),
+                            "views": selected.get("viewCount", 0)
                         }
                     }
                 
