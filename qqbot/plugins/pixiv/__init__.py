@@ -7,17 +7,14 @@ import os
 import aiofiles
 from nonebot import on_command, logger, get_driver
 from nonebot.adapters.onebot.v11 import MessageSegment, Bot, Event
-from typing import Dict, Any
 import asyncio
 import ssl
 import traceback
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-
-# ====== 重要配置（必须修改） ======
+# ====== 重要配置（必须修改） ======#
 # 从环境变量获取配置
 env = get_driver().config
-
 # 优先使用环境变量，其次使用默认值
 PROXY = getattr(env, "PROXY_ADDRESS", "http://127.0.0.1:7890")  # 本地代理地址
 USE_PROXY = getattr(env, "USE_PROXY", True)  # 是否使用代理
@@ -44,9 +41,7 @@ EXCLUDE_DURATION = 3600  # 1小时内不重复使用同一作品
 
 # ====== 核心函数 ======
 async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
-    """
-    通过角色标签搜索Pixiv图片（优化重复率，添加R-18过滤，按热度排序且限制近一周）
-    """
+    """通过角色标签搜索Pixiv图片（优化重复率，添加R-18过滤，按热度排序且限制近一周）"""
     search_tag = " ".join(tags)
     encoded_tag = urllib.parse.quote(search_tag)
     
@@ -56,29 +51,28 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     # ===== 关键修改2：设置安全模式参数 =====
     search_mode = "all" if is_explicit_r18_request else "safe"
     
-    # ===== 关键优化：按热度排序 + 近一周时间范围 =====
+    # ===== 关键优化：按热度排序 + 近180天时间范围 =====
     # 计算近一周的日期范围 (格式: YYYY-MM-DD)
     end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    start_date = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
     
     # ===== 关键修改3：扩大随机偏移量范围 =====
     # 覆盖3页(180张)作品，显著增加多样性
     offset = random.randint(0, 180)
     page = max(1, offset // 60 + 1)  # 确保page至少为1
-    start_index = offset % 60
     
     url = f"https://www.pixiv.net/ajax/search/artworks/{encoded_tag}"
     params = {
         "word": search_tag,
         "order": "popular_d",  # 按热度降序排列
-        "mode": search_mode,   # 使用安全模式参数
+        "mode": search_mode,  # 使用安全模式参数
         "p": page,
         "s_mode": "s_tag",
         "type": "all",
         "lang": "zh",
-        "scd": start_date,     # 开始日期 (近一周)
-        "ecd": end_date,       # 结束日期 (今天)
-        "blt": "200"           # 最低收藏数 (过滤低质量作品)
+        "scd": start_date,  # 开始日期
+        "ecd": end_date,  # 结束日期 (今天)
+        "blt": "200"  # 最低收藏数 (过滤低质量作品)
     }
     
     headers = {
@@ -94,7 +88,6 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     
     try:
         proxy = PROXY if USE_PROXY else None
-        
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, params=params, proxy=proxy, timeout=30) as response:
                 if response.status != 200:
@@ -107,13 +100,12 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                     raise Exception(f"搜索API失败，状态码: {response.status}, 详情: {error_msg}")
                 
                 data = await response.json()
-                
                 if not data.get("body") or not data["body"].get("illustManga"):
                     raise Exception("API返回空数据，可能标签无效或Cookie失效")
                 
                 # 获取整页作品（60张）
                 all_results = [
-                    item for item in data["body"]["illustManga"]["data"] 
+                    item for item in data["body"]["illustManga"]["data"]
                     if item and isinstance(item, dict) and "id" in item and item.get("isAdContainer", 0) == 0
                 ]
                 
@@ -146,19 +138,14 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 # ===== 关键修改4：重构选择逻辑（质量+新鲜度综合评分）=====
                 scored_candidates = []
                 current_time = datetime.now(timezone.utc)
-                
                 for item in filtered_results:
                     # 获取作品质量指标
                     bookmark_count = item.get("bookmarkCount", 0)  # 收藏数
-                    like_count = item.get("likeCount", 0)          # 点赞数
-                    view_count = item.get("viewCount", 0)          # 浏览数
+                    like_count = item.get("likeCount", 0)  # 点赞数
+                    view_count = item.get("viewCount", 0)  # 浏览数
                     
                     # 计算基础质量分数（降低权重放大效应）
-                    quality_score = (
-                        bookmark_count * 3 + 
-                        like_count * 2 + 
-                        view_count * 0.05
-                    )
+                    quality_score = (bookmark_count * 3 + like_count * 2 + view_count * 0.05)
                     
                     # 添加新鲜度因子（近7天作品优先）
                     create_date = item.get("createDate", "")
@@ -169,9 +156,7 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                                 create_time = datetime.strptime(create_date.split("T")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
                             else:
                                 create_time = datetime.strptime(create_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                            
-                            days_old = (current_time - create_time).days
-                            # 7天内新作品有加成，越新权重越高
+                            days_old = (current_time - create_time).days  # 7天内新作品有加成，越新权重越高
                             freshness_factor = max(0.5, 1 - (days_old / 7))
                             quality_score *= freshness_factor
                         except Exception as date_error:
@@ -184,7 +169,6 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 
                 # 仅取前50个高质量作品
                 candidates = [item for _, item in scored_candidates[:50]]
-                
                 if not candidates:
                     raise Exception("未找到有效作品，请尝试其他标签或检查Cookie是否有效")
                 
@@ -212,6 +196,7 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                     retry_count += 1
                     if len(candidates) <= 1:
                         break
+                    
                     # 从未使用过的作品中重新选择
                     unused_candidates = [item for item in candidates if str(item["id"]) not in RECENT_IMAGES]
                     if unused_candidates:
@@ -222,7 +207,7 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                         oldest_pid = min(RECENT_IMAGES.items(), key=lambda x: x[1])[0]
                         selected = next((item for item in candidates if str(item["id"]) == oldest_pid), selected)
                         illust_id = selected["id"]
-                        break
+                    break
                 
                 # 记录当前使用的作品
                 RECENT_IMAGES[str(illust_id)] = current_timestamp
@@ -278,7 +263,6 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                             "views": selected.get("viewCount", 0)
                         }
                     }
-                
     except Exception as e:
         raise Exception(f"搜索失败: {str(e)}")
 
@@ -305,7 +289,6 @@ def replace_image_domain(url: str) -> str:
     
     # 替换URL中的特殊字符（防止路径问题）
     url = url.replace(' ', '%20').replace('&', '%26').replace('?', '%3F')
-    
     return url
 
 # ====== 原图专用处理函数 ======
@@ -320,45 +303,86 @@ async def get_remote_file_size(url: str) -> int:
         
         async with aiohttp.ClientSession() as session:
             async with session.head(
-                url, 
-                headers=headers,
-                proxy=proxy,
-                timeout=aiohttp.ClientTimeout(total=10)
+                url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10)
             ) as response:
                 if response.status in (200, 206):
                     content_range = response.headers.get('Content-Range', '')
                     if content_range:
                         # 从Content-Range中提取文件大小：bytes 0-0/12345678
                         return int(content_range.split('/')[-1])
+                    
                     content_length = response.headers.get('Content-Length')
                     if content_length:
                         return int(content_length)
-                else:
-                    # 尝试GET请求前1KB
-                    headers['Range'] = 'bytes=0-1023'
-                    async with session.get(
-                        url,
-                        headers=headers,
-                        proxy=proxy,
-                        timeout=aiohttp.ClientTimeout(total=10)
-                    ) as response:
-                        if response.status in (200, 206):
-                            content_length = response.headers.get('Content-Length')
-                            if content_length:
-                                # 估算完整文件大小（1024字节是头部，总大小通常大于头部）
-                                estimated_size = int(content_length)
-                                return estimated_size * 10  # 粗略估计
-        
-        return 0
+                    else:
+                        # 尝试GET请求前1KB
+                        headers['Range'] = 'bytes=0-1023'
+                        async with session.get(
+                            url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=10)
+                        ) as response:
+                            if response.status in (200, 206):
+                                content_length = response.headers.get('Content-Length')
+                                if content_length:
+                                    # 估算完整文件大小（1024字节是头部，总大小通常大于头部）
+                                    estimated_size = int(content_length)
+                                    return estimated_size * 10  # 粗略估计
+                
+                return 0
     except Exception as e:
         logger.warning(f"获取文件大小失败: {str(e)}")
         return 0
 
+# ====== 添加图片压缩功能 ======
+try:
+    from PIL import Image
+    import io
+    PILLLOW_AVAILABLE = True
+except ImportError:
+    PILLLOW_AVAILABLE = False
+
+async def compress_image(file_path: Path, max_size: int = 10 * 1024 * 1024) -> Path:
+    """压缩图片，确保不超过指定大小（10MB）"""
+    if not PILLLOW_AVAILABLE:
+        logger.warning("Pillow库未安装，无法压缩图片")
+        return None
+    
+    try:
+        # 读取图片
+        with Image.open(file_path) as img:
+            # 获取原始尺寸
+            width, height = img.size
+            
+            # 如果图片已经小于10MB，直接返回
+            if file_path.stat().st_size <= max_size:
+                return file_path
+            
+            # 尝试压缩图片
+            quality = 95
+            while quality > 50 and file_path.stat().st_size > max_size:
+                # 保存压缩后的图片
+                buffer = io.BytesIO()
+                img.save(buffer, format="JPEG", quality=quality, optimize=True)
+                buffer.seek(0)
+                compressed_size = buffer.tell()
+                
+                # 如果压缩后的大小符合要求，保存并返回
+                if compressed_size <= max_size:
+                    new_file_path = file_path.with_suffix('.jpg')
+                    with open(new_file_path, 'wb') as f:
+                        f.write(buffer.read())
+                    return new_file_path
+                
+                quality -= 5
+            
+            # 如果压缩到最低质量仍然太大，使用预览图
+            return None
+    except Exception as e:
+        logger.error(f"图片压缩失败: {str(e)}")
+        return None
+
 async def download_original_image(url: str) -> Path:
-    """安全下载大文件到临时位置，返回文件路径"""
+    """安全下载大文件到临时位置，返回文件路径（确保不超过10MB）"""
     file_size = await get_remote_file_size(url)
-    if file_size > 10 * 1024 * 1024:  # 超过10MB警告
-        logger.warning(f"⚠️ 检测到超大文件 ({file_size/1024/1024:.1f}MB)，可能发送失败")
     
     # 生成唯一文件名
     timestamp = int(time.time() * 1000)
@@ -394,11 +418,7 @@ async def download_original_image(url: str) -> Path:
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
-                    url,
-                    headers=headers,
-                    proxy=proxy,
-                    timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT),
-                    ssl=ssl_context
+                    url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT), ssl=ssl_context
                 ) as response:
                     if response.status != 200:
                         error_text = await response.text()
@@ -407,27 +427,21 @@ async def download_original_image(url: str) -> Path:
                     # 分块写入文件，避免内存溢出
                     total_bytes = 0
                     start_time = time.time()
-                    
                     async with aiofiles.open(temp_path, 'wb') as f:
                         async for chunk in response.content.iter_chunked(MAX_DOWNLOAD_CHUNK):
                             await f.write(chunk)
                             total_bytes += len(chunk)
-                            # 每10MB记录一次进度
-                            if total_bytes % (10 * 1024 * 1024) == 0:
-                                elapsed = time.time() - start_time
-                                speed = total_bytes / elapsed / 1024 / 1024  # MB/s
-                                logger.info(f"下载进度: {total_bytes/1024/1024:.1f}MB, 速度: {speed:.2f}MB/s")
                     
                     # 验证文件完整性
                     downloaded_size = temp_path.stat().st_size
-                    if file_size > 0 and downloaded_size < file_size * 0.9:  # 允许10%误差
+                    if file_size > 0 and downloaded_size < file_size * 0.9:
                         raise Exception(f"文件不完整: 期望 {file_size} 字节, 实际 {downloaded_size} 字节")
                     
                     # 验证图片有效性（需要Pillow）
                     try:
-                        from PIL import Image
-                        with Image.open(temp_path) as img:
-                            img.verify()  # 验证是否为有效的图片格式
+                        if PILLLOW_AVAILABLE:
+                            with Image.open(temp_path) as img:
+                                img.verify()  # 验证是否为有效的图片格式
                     except ImportError:
                         logger.warning("未安装Pillow库，跳过图片验证。建议安装: pip install Pillow")
                     except Exception as e:
@@ -438,26 +452,35 @@ async def download_original_image(url: str) -> Path:
                             temp_path.rename(new_path)
                             temp_path = new_path
                     
+                    # 检查文件大小并压缩（如果需要）
+                    if downloaded_size > 10 * 1024 * 1024:  # 超过10MB
+                        logger.warning(f"⚠️ 图片过大 ({downloaded_size/1024/1024:.1f}MB)，尝试压缩...")
+                        compressed_path = await compress_image(temp_path)
+                        if compressed_path:
+                            temp_path = compressed_path
+                            logger.info(f"✅ 图片已压缩至 {temp_path.stat().st_size/1024/1024:.2f}MB")
+                        else:
+                            logger.warning("⚠️ 图片压缩失败，将使用预览图")
+                            return None  # 返回None表示需要使用预览图
+                    
                     logger.info(f"✅ 原图下载成功: {downloaded_size/1024/1024:.2f}MB, 耗时: {time.time()-start_time:.1f}s")
                     return temp_path
-                    
         except Exception as e:
             logger.error(f"下载尝试 {attempt+1}/{MAX_ATTEMPTS} 失败: {str(e)}")
             if attempt == MAX_ATTEMPTS - 1:
                 raise
-            await asyncio.sleep(2)  # 重试前等待
+            await asyncio.sleep(2)
     
-    raise Exception("所有下载尝试均失败")
+    return temp_path  # 如果没有返回，返回临时路径
 
 async def cleanup_temp_files():
-    """清理24小时以上的临时文件"""
+    """清理12小时以上的临时文件"""
     try:
         now = time.time()
-        
         for file_path in TEMP_DIR.glob("*"):
             if file_path.is_file():
                 file_age = now - file_path.stat().st_mtime
-                if file_age > 24 * 3600:  # 24小时
+                if file_age > 12 * 3600:  # 12小时
                     try:
                         file_path.unlink()
                         logger.debug(f"清理旧临时文件: {file_path.name}")
@@ -507,30 +530,55 @@ async def handle_pixiv_command(bot: Bot, event: Event):
             # 下载原图
             file_path = await download_original_image(result['image_url'])
             
-            # ===== 关键修复：验证文件存在且可读 =====
-            if not file_path.exists():
-                raise FileNotFoundError(f"文件不存在: {file_path}")
+            # 检查文件是否存在
+            if not file_path or not file_path.exists():
+                if file_path is None:
+                    logger.warning("⚠️ 原图压缩失败，将使用预览图")
+                else:
+                    raise FileNotFoundError(f"文件不存在: {file_path}")
+                
+                # 降级发送预览图
+                fallback_msg = (
+                    f"⚠️ 原图过大或压缩失败，已自动降级为预览图\n"
+                    f"🔗 原图下载: {result['image_url']}\n\n"
+                    f"🖼️ 当前显示预览图（点击链接下载原图）:"
+                )
+                await bot.send(event, fallback_msg)
+                
+                # 发送预览图
+                preview_data = await download_and_process_preview(result['preview_url'])
+                await bot.send(event, MessageSegment.image(preview_data))
+                return
             
+            # 检查文件大小
             file_size = file_path.stat().st_size
-            if file_size == 0:
-                raise ValueError(f"文件为空: {file_path}")
+            if file_size > 10 * 1024 * 1024:  # 超过10MB
+                logger.warning(f"⚠️ 图片过大 ({file_size/1024/1024:.1f}MB)，已自动降级为预览图")
+                fallback_msg = (
+                    f"⚠️ 原图过大（{file_size/1024/1024:.1f}MB），已自动降级为预览图\n"
+                    f"🔗 原图下载: {result['image_url']}\n\n"
+                    f"🖼️ 当前显示预览图（点击链接下载原图）:"
+                )
+                await bot.send(event, fallback_msg)
+                
+                # 发送预览图
+                preview_data = await download_and_process_preview(result['preview_url'])
+                await bot.send(event, MessageSegment.image(preview_data))
+                return
             
-            logger.info(f"文件验证通过，大小: {file_size/1024/1024:.2f}MB")
+            # 发送原图
             logger.info(f"准备发送文件路径: {file_path}")
             
-            # ===== 关键修复：直接使用文件路径（不是file:// URL） =====
             start_time = time.time()
-            
-            # # 方法1：直接传递文件路径
-            # await bot.send(event, MessageSegment.image(str(file_path.resolve())))
-            
-            # 如果方法1失败，可以尝试方法2：读取文件内容
-            async with aiofiles.open(file_path, 'rb') as f:
-                image_data = await f.read()
-            await bot.send(event, MessageSegment.image(image_data))
-            
-            logger.info(f"✅ 原图发送成功! 耗时: {time.time()-start_time:.1f}s")
-            
+            # 读取文件内容
+            try:
+                async with aiofiles.open(file_path, 'rb') as f:
+                    image_data = await f.read()
+                await bot.send(event, MessageSegment.image(image_data))
+                logger.info(f"✅ 原图发送成功! 耗时: {time.time()-start_time:.1f}s")
+            except Exception as e:
+                logger.error(f"发送失败: {str(e)}")
+                raise e
             # 4. 同步清理文件（确保发送完成后再删除）
             try:
                 # 等待一小段时间确保消息完全发送
@@ -540,14 +588,14 @@ async def handle_pixiv_command(bot: Bot, event: Event):
                     logger.debug(f"✅ 已清理临时文件: {file_path}")
             except Exception as e:
                 logger.warning(f"清理文件警告 {file_path}: {str(e)}")
-            
+        
         except Exception as e:
             error_msg = str(e)
             logger.error(f"原图发送失败: {error_msg}\n{traceback.format_exc()}")
             
             # 降级方案：发送预览图 + 原图链接
             fallback_msg = (
-                f"⚠️ 原图发送失败（可能文件过大），已自动降级\n"
+                f"⚠️ 原图发送失败（可能文件过大或网络问题），已自动降级\n"
                 f"🔗 原图下载: {result['image_url']}\n\n"
                 f"🖼️ 当前显示预览图（点击链接下载原图）:"
             )
@@ -613,16 +661,11 @@ async def download_and_process_preview(image_url: str) -> bytes:
         
         async with aiohttp.ClientSession() as session:
             async with session.get(
-                image_url,
-                headers=headers,
-                proxy=proxy,
-                timeout=aiohttp.ClientTimeout(total=15)
+                image_url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15)
             ) as response:
                 if response.status != 200:
                     raise Exception(f"预览图下载失败，状态码: {response.status}")
-                
                 return await response.read()
-                
     except Exception as e:
         logger.error(f"预览图处理失败: {str(e)}")
         raise Exception(f"预览图处理失败: {str(e)}")
