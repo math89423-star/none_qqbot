@@ -12,6 +12,7 @@ import ssl
 import traceback
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
+
 # ====== 重要配置（必须修改） ======#
 # 从环境变量获取配置
 env = get_driver().config
@@ -20,6 +21,10 @@ PROXY = getattr(env, "PROXY_ADDRESS", "http://127.0.0.1:7890")  # 本地代理�
 USE_PROXY = getattr(env, "USE_PROXY", True)  # 是否使用代理
 PROXY_URL = getattr(env, "CF_WORKER_URL", "https://quiet-hill-31f3.math89423.workers.dev/")  # Cloudflare Workers地址
 PIXIV_COOKIE = getattr(env, "PIXIV_COOKIE", "PHPSESSID=14916444_EuNtNE3Yd2ZZ50A7UzivUlxP7O2hLP7s; device_token=ccd49454e972c3b547f1db56a3560575; p_ab_id=1; p_ab_id_2=1")
+
+# ===== 新增：冷却机制配置 =====
+COOLDOWN_TIME = 25  # 25秒冷却时间
+last_request_time = {}  # {user_id: last_request_time}
 
 # 基础项目目录
 BASE_DIR = Path(__file__).parent.parent.parent.absolute()
@@ -495,6 +500,21 @@ pixiv_cmd = on_command("pixiv", aliases={"p"}, priority=5, block=True)
 @pixiv_cmd.handle()
 async def handle_pixiv_command(bot: Bot, event: Event):
     """处理 /pixiv 命令 - 原图优先模式"""
+    # ===== 新增：冷却机制检查 =====
+    user_id = event.get_user_id()
+    current_time = time.time()
+    
+    # 检查是否在冷却中
+    if user_id in last_request_time:
+        elapsed = current_time - last_request_time[user_id]
+        if elapsed < COOLDOWN_TIME:
+            remaining = COOLDOWN_TIME - elapsed
+            await bot.send(event, f"请求过于频繁，请等待 {remaining:.1f} 秒后再试")
+            return
+    
+    # 更新最后请求时间
+    last_request_time[user_id] = current_time
+    
     raw_message = str(event.get_message()).strip()
     command_str = event.get_plaintext().split()[0]
     args = raw_message[len(command_str):].strip()
