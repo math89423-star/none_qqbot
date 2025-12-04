@@ -6,6 +6,7 @@ import time
 import logging
 import aiohttp
 import aiofiles
+import json  
 from nonebot import on_command, logger, get_driver
 from nonebot.adapters.onebot.v11 import MessageSegment, Bot, Event
 from pathlib import Path
@@ -39,10 +40,23 @@ USE_PROXY = config.getboolean('DEFAULT', 'USE_PROXY', fallback=True)
 last_request_time = {}  # {user_id: last_request_time}
 
 
+# ====== 新增：角色昵称数据加载 ======
+# 尝试加载角色数据文件
+character_data = {}
+character_file = os.path.join(config_dir, 'character.json')
+if os.path.exists(character_file):
+    try:
+        with open(character_file, 'r', encoding='utf-8') as f:
+            character_data = json.load(f)
+        logger.info(f"角色数据加载成功，共 {len(character_data)} 个角色")
+    except Exception as e:
+        logger.error(f"加载角色数据失败: {str(e)}")
+        character_data = {}  # 加载失败时清空数据
+else:
+    logger.warning("角色数据文件 character.json 不存在，将使用空数据")
 
 # ====== Nonebot2插件逻辑 ======
 pixiv_cmd = on_command("pixiv", aliases={"p"}, priority=5, block=True)
-
 @pixiv_cmd.handle()
 async def handle_pixiv_command(bot: Bot, event: Event):
     """处理 /pixiv 命令 - 原图优先模式"""
@@ -214,6 +228,53 @@ async def handle_pixiv_command(bot: Bot, event: Event):
             error_msg = f"发生未知错误: {error_msg}"
         
         await bot.send(event, f"❌ 搜索失败: {error_msg}")
+
+# ====== 新增：搜图帮助命令 ======
+help_cmd = on_command("搜图帮助", aliases={"help", "sotu"}, priority=5, block=True)
+@help_cmd.handle()
+async def handle_help_command(bot: Bot, event: Event):
+    """处理 /搜图帮助 命令 - 查询角色昵称"""
+    # 获取命令参数（移除命令名）
+    args = event.get_plaintext().replace('/搜图帮助', '', 1).replace('搜图帮助', '', 1).strip()
+    
+    logger.debug(f"Received help command with args: '{args}'")
+    
+    if not args:
+        # 无参数，返回所有角色列表
+        if not character_data:
+            await bot.send(event, "角色数据文件不存在或为空，请联系管理员添加角色数据")
+            return
+            
+        # 获取所有角色中文名
+        roles = list(character_data.keys())
+        roles.sort()  # 按字母排序
+        
+        # 构建角色列表消息
+        msg = "🎯 常见角色列表（输入 /搜图帮助 [角色名] 获取详细昵称）\n\n"
+        msg += "• " + "\n• ".join(roles[:20])  # 显示前20个角色
+        if len(roles) > 20:
+            msg += f"\n\n... 共 {len(roles)} 个角色（仅显示前20个）"
+        
+        await bot.send(event, msg)
+    else:
+        # 有参数，查询特定角色
+        role_name = args
+        if role_name in character_data:
+            nicknames = character_data[role_name].get("昵称", [])
+            if nicknames:
+                # 构建昵称列表消息
+                msg = f"🎭 角色: {role_name}\n\n"
+                msg += "• " + "\n• ".join(nicknames)
+                await bot.send(event, msg)
+            else:
+                await bot.send(event, f"角色 {role_name} 没有定义昵称")
+        else:
+            # 尝试模糊匹配（如果需要）
+            matches = [r for r in character_data.keys() if role_name in r]
+            if matches:
+                await bot.send(event, f"未找到精确匹配的角色 {role_name}，可能的匹配:\n• " + "\n• ".join(matches[:5]))
+            else:
+                await bot.send(event, f"未找到角色 {role_name}，请检查输入")
 
 # ====== 预览图处理函数（降级用） ======
 async def download_and_process_preview(image_url: str) -> bytes:
