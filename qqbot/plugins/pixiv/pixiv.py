@@ -45,41 +45,42 @@ RECENT_IMAGES = {}  # {pid: last_used_time}
 logger = logging.getLogger('logger')
 logger.setLevel(logging.DEBUG)  # 设置最低日志级别
 
-# ====== PIXIV逻辑核心函数 ======
+# ====== PIXIV逻辑核心函数 (优化版) ======
 async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
-    """通过角色标签搜索Pixiv图片（优化重复率，添加R-18过滤，按热度排序且限制近一周）"""
+    """通过角色标签搜索Pixiv图片（智能适应新角色/冷门角色，三阶段重试策略）"""
     search_tag = " ".join(tags)
     encoded_tag = urllib.parse.quote(search_tag)
     
     # ===== 检查是否明确请求R-18内容 =====
     is_explicit_r18_request = any(tag.lower() in ["r-18", "r18", "r-18g", "r18g"] for tag in tags)
-    
-    # ===== 设置安全模式参数 =====
     search_mode = "all" if is_explicit_r18_request else "safe"
     
-    # ===== 按热度排序 + 近90天时间范围 =====
-    # 计算近90天的日期范围 (格式: YYYY-MM-DD)
-    end_date = datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d")
-    
-    # ===== 扩大随机偏移量范围 =====
-    # 覆盖3页(180张)作品，显著增加多样性
-    offset = random.randint(0, 180)
-    page = max(1, offset // 60 + 1)  # 确保page至少为1
-    
-    url = f"https://www.pixiv.net/ajax/search/artworks/{encoded_tag}"
-    params = {
-        "word": search_tag,
-        "order": "popular_d",  # 按热度降序排列
-        "mode": search_mode,  # 使用安全模式参数
-        "p": page,
-        "s_mode": "s_tag",
-        "type": "all",
-        "lang": "zh",
-        "scd": start_date,  # 开始日期
-        "ecd": end_date,  # 结束日期 (今天)
-        "blt": "200"  # 最低收藏数 (过滤低质量作品)
-    }
+    # ===== 三阶段搜索策略配置 =====
+    search_strategies = [
+        {
+            "name": "精准模式(90天+高收藏)",
+            "params": {
+                "scd": (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d"),
+                "ecd": datetime.now().strftime("%Y-%m-%d"),
+                "blt": "200"  # 初始高质量阈值
+            }
+        },
+        {
+            "name": "宽松模式(180天+中收藏)",
+            "params": {
+                "scd": (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d"),
+                "ecd": datetime.now().strftime("%Y-%m-%d"),
+                "blt": "100"  # 降低质量阈值
+            }
+        },
+        {
+            "name": "全站模式(无限制)",
+            "params": {
+                # 不设置时间范围
+                "blt": "0"  # 最低收藏数设为0
+            }
+        }
+    ]
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -92,185 +93,224 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
         "X-Requested-With": "XMLHttpRequest"
     }
     
-    try:
-        proxy = PROXY if USE_PROXY else None
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers, params=params, proxy=proxy, timeout=30) as response:
-                if response.status != 200:
-                    error_text = await response.text()
-                    try:
-                        error_json = json.loads(error_text)
-                        error_msg = error_json.get("error", {}).get("message", error_text[:200])
-                    except:
-                        error_msg = error_text[:200]
-                    raise Exception(f"搜索API失败，状态码: {response.status}, 详情: {error_msg}")
-                
-                data = await response.json()
-                if not data.get("body") or not data["body"].get("illustManga"):
-                    raise Exception("API返回空数据，可能标签无效或Cookie失效")
-                
-                # 获取整页作品（60张）
-                all_results = [
-                    item for item in data["body"]["illustManga"]["data"]
-                    if item and isinstance(item, dict) and "id" in item and item.get("isAdContainer", 0) == 0
-                ]
-                
-                # R-18内容过滤
-                filtered_results = []
-                for item in all_results:
-                    # 获取作品标签（安全访问）
-                    tags_info = item.get("tags", [])
-                    if isinstance(tags_info, dict):
-                        tags_info = tags_info.get("tags", [])
+    proxy = PROXY if USE_PROXY else None
+    current_time = datetime.now(timezone.utc)
+    
+    # ===== 三阶段重试策略 =====
+    for strategy_idx, strategy in enumerate(search_strategies):
+        try:
+            # 为每次尝试生成新的随机偏移（扩大覆盖范围）
+            offset = random.randint(0, 180)
+            page = max(1, offset // 60 + 1)
+            
+            url = f"https://www.pixiv.net/ajax/search/artworks/{encoded_tag}"
+            params = {
+                "word": search_tag,
+                "order": "popular_d",
+                "mode": search_mode,
+                "p": page,
+                "s_mode": "s_tag",
+                "type": "all",
+                "lang": "zh",
+                **strategy["params"]  # 合并当前策略参数
+            }
+            
+            async with aiohttp.ClientSession() as session:
+                # ===== 执行搜索请求 =====
+                async with session.get(
+                    url, 
+                    headers=headers, 
+                    params=params, 
+                    proxy=proxy, 
+                    timeout=30
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        raise Exception(f"策略[{strategy['name']}]请求失败: {response.status}")
                     
-                    # 提取标签名称
-                    tag_names = [tag.get("tag", "").lower() for tag in tags_info if isinstance(tag, dict)]
+                    data = await response.json()
+                    if not data.get("body") or not data["body"].get("illustManga", {}).get("data"):
+                        raise Exception(f"策略[{strategy['name']}]返回空数据")
                     
-                    # 检查R-18/R-18G标签
-                    is_r18 = any("r-18" in tag or "r18" in tag for tag in tag_names)
-                    is_r18g = any("r-18g" in tag or "r18g" in tag for tag in tag_names)
+                    # ===== 预处理结果 =====
+                    all_results = [
+                        item for item in data["body"]["illustManga"]["data"]
+                        if item and isinstance(item, dict) 
+                        and item.get("id") 
+                        and item.get("isAdContainer", 0) == 0
+                    ]
                     
-                    # 仅保留符合条件的作品
-                    if is_explicit_r18_request or (not is_r18 and not is_r18g):
-                        filtered_results.append(item)
-                
-                # 结果不足时的处理
-                if not filtered_results:
-                    if not is_explicit_r18_request:
-                        raise Exception("未找到适合的内容。")
-                    else:
-                        raise Exception("未找到匹配的作品，请尝试其他标签或检查Cookie是否有效")
-                
-                # 质量+新鲜度综合评分
-                scored_candidates = []
-                current_time = datetime.now(timezone.utc)
-                for item in filtered_results:
-                    # 获取作品质量指标
-                    bookmark_count = item.get("bookmarkCount", 0)  # 收藏数
-                    like_count = item.get("likeCount", 0)  # 点赞数
-                    view_count = item.get("viewCount", 0)  # 浏览数
+                    # ===== R-18内容智能过滤 =====
+                    filtered_results = []
+                    for item in all_results:
+                        # 安全获取标签
+                        tags_info = item.get("tags", [])
+                        if isinstance(tags_info, dict):
+                            tags_info = tags_info.get("tags", [])
+                        
+                        tag_names = [tag.get("tag", "").lower() 
+                                   for tag in tags_info 
+                                   if isinstance(tag, dict)]
+                        
+                        # 检测R-18内容
+                        is_r18 = any("r-18" in tag or "r18" in tag for tag in tag_names)
+                        is_r18g = any("r-18g" in tag or "r18g" in tag for tag in tag_names)
+                        
+                        # 仅保留符合条件的作品
+                        if is_explicit_r18_request or (not is_r18 and not is_r18g):
+                            filtered_results.append(item)
                     
-                    # 计算基础质量分数（降低权重放大效应）
-                    quality_score = (bookmark_count * 3 + like_count * 2 + view_count * 0.05)
+                    # ===== 质量+新鲜度评分 =====
+                    scored_items = []
+                    for item in filtered_results:
+                        # 基础质量指标
+                        bookmark_count = item.get("bookmarkCount", 0)
+                        like_count = item.get("likeCount", 0)
+                        view_count = item.get("viewCount", 0)
+                        
+                        # 质量分数 (降低权重放大效应)
+                        quality_score = (bookmark_count * 3 + like_count * 2 + view_count * 0.05)
+                        
+                        # 新鲜度加成 (新角色保护)
+                        create_date = item.get("createDate", "")
+                        if create_date:
+                            try:
+                                # 统一日期格式处理
+                                clean_date = create_date.split("T")[0]
+                                create_time = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                                days_old = (current_time - create_time).days
+                                
+                                # 新角色特殊处理：30天内作品获得额外权重
+                                if days_old <= 30:
+                                    freshness_factor = 1.5  # 新作品1.5倍权重
+                                elif days_old <= 90:
+                                    freshness_factor = 1.0
+                                else:
+                                    # 超过90天但符合当前策略的作品
+                                    freshness_factor = max(0.3, 1 - (days_old / 365))
+                                
+                                quality_score *= freshness_factor
+                            except Exception as date_error:
+                                logger.debug(f"日期解析失败({item.get('id')}): {str(date_error)}")
+                        
+                        scored_items.append((quality_score, item))
                     
-                    # 添加新鲜度因子（近30天作品优先）
-                    create_date = item.get("createDate", "")
-                    if create_date:
-                        try:
-                            # 处理不同格式的日期
-                            if "T" in create_date:
-                                create_time = datetime.strptime(create_date.split("T")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                            else:
-                                create_time = datetime.strptime(create_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-                            days_old = (current_time - create_time).days  # 30天内新作品有加成，越新权重越高
-                            freshness_factor = max(0.5, 1 - (days_old / 30))
-                            quality_score *= freshness_factor
-                        except Exception as date_error:
-                            logger.debug(f"日期解析失败: {date_error}")
+                    # 按质量排序
+                    scored_items.sort(key=lambda x: x[0], reverse=True)
+                    candidates = [item for _, item in scored_items[:100]]  # 保留100个候选
                     
-                    scored_candidates.append((quality_score, item))
-                
-                # 按质量分数排序（降序）
-                scored_candidates.sort(key=lambda x: x[0], reverse=True)
-                
-                # 仅取前50个高质量作品
-                candidates = [item for _, item in scored_candidates[:50]]
-                if not candidates:
-                    raise Exception("未找到有效作品，请尝试其他标签或检查Cookie是否有效")
-                
-                # 智能选择策略（70%高质量/30%随机）
-                if random.random() < 0.7:
-                    # 70%概率从高质量区选择（前30%）
-                    high_quality_pool = candidates[:max(1, len(candidates) // 3)]
-                    selected = random.choice(high_quality_pool)
-                else:
-                    # 30%概率完全随机（保证多样性）
-                    selected = random.choice(candidates)
-                
-                illust_id = selected["id"]
-                
-                # 近期图片排除机制 
-                current_timestamp = time.time()
-                # 清理过期缓存
-                for pid, timestamp in list(RECENT_IMAGES.items()):
-                    if current_timestamp - timestamp > EXCLUDE_DURATION:
-                        del RECENT_IMAGES[pid]
-                
-                # 检查是否近期使用过
-                retry_count = 0
-                while str(illust_id) in RECENT_IMAGES and retry_count < 5:
-                    retry_count += 1
-                    if len(candidates) <= 1:
-                        break
+                    # ===== 结果验证 =====
+                    if not candidates:
+                        logger.debug(f"策略[{strategy['name']}]无有效结果，尝试下一策略")
+                        continue
                     
-                    # 从未使用过的作品中重新选择
-                    unused_candidates = [item for item in candidates if str(item["id"]) not in RECENT_IMAGES]
-                    if unused_candidates:
-                        selected = random.choice(unused_candidates)
-                        illust_id = selected["id"]
-                    else:
-                        # 所有候选作品近期都用过，选择最久未用的
-                        oldest_pid = min(RECENT_IMAGES.items(), key=lambda x: x[1])[0]
-                        selected = next((item for item in candidates if str(item["id"]) == oldest_pid), selected)
-                        illust_id = selected["id"]
-                    break
-                
-                # 记录当前使用的作品
-                RECENT_IMAGES[str(illust_id)] = current_timestamp
-                
-                # 获取作品详情
-                illust_url = f"https://www.pixiv.net/ajax/illust/{illust_id}"
-                illust_headers = {
-                    **headers,
-                    "Referer": f"https://www.pixiv.net/artworks/{illust_id}"
-                }
-                
-                async with session.get(illust_url, headers=illust_headers, proxy=proxy, timeout=30) as illust_response:
-                    if illust_response.status != 200:
-                        error_text = await illust_response.text()
-                        raise Exception(f"获取作品详情失败，状态码: {illust_response.status}, 响应: {error_text[:200]}")
+                    # ===== 智能选择机制 =====
+                    selected = None
+                    current_timestamp = time.time()
                     
-                    illust_data = await illust_response.json()
-                    if illust_data.get("error"):
-                        raise Exception(f"作品详情API错误: {illust_data['message']}")
+                    # 1. 优先选择高质量且未使用过的作品
+                    unused_high_quality = [
+                        item for item in candidates[:30] 
+                        if str(item["id"]) not in RECENT_IMAGES
+                    ]
                     
-                    illust_body = illust_data["body"]
+                    if unused_high_quality:
+                        selected = random.choice(unused_high_quality)
+                    # 2. 次选：所有未使用过的作品
+                    elif len(candidates) > 1:
+                        unused_all = [
+                            item for item in candidates
+                            if str(item["id"]) not in RECENT_IMAGES
+                        ]
+                        if unused_all:
+                            selected = random.choice(unused_all)
                     
-                    # 再次检查R-18标签
-                    work_tags = [tag.get("tag", "") for tag in illust_body.get("tags", {}).get("tags", [])]
-                    is_work_r18 = any(tag.lower() in ["r-18", "r18"] for tag in work_tags)
-                    is_work_r18g = any(tag.lower() in ["r-18g", "r18g"] for tag in work_tags)
+                    # 3. 保底：使用最久未用的作品
+                    if not selected:
+                        # 清理过期缓存
+                        for pid, timestamp in list(RECENT_IMAGES.items()):
+                            if current_timestamp - timestamp > EXCLUDE_DURATION:
+                                del RECENT_IMAGES[pid]
+                        
+                        # 找出最久未用的作品
+                        oldest_pid = min(RECENT_IMAGES.items(), key=lambda x: x[1])[0] if RECENT_IMAGES else None
+                        if oldest_pid:
+                            selected = next(
+                                (item for item in candidates if str(item["id"]) == oldest_pid),
+                                candidates[0]
+                            )
+                        else:
+                            selected = candidates[0]
                     
-                    # 如果不是明确请求R-18且作品包含R-18标签，重新搜索
-                    if not is_explicit_r18_request and (is_work_r18 or is_work_r18g):
-                        logger.warning(f"检测到R-18内容但未明确请求，跳过作品ID: {illust_id}")
-                        # 为避免无限递归，不在此处递归，而是抛出异常让用户重试
-                        raise Exception("检测到不适当内容，已跳过。请尝试其他标签。")
-                    
-                    original_img_url = illust_body["urls"]["original"]
-                    regular_img_url = illust_body["urls"]["regular"]
-                    
-                    # 构建代理后的图片URL
-                    proxy_original_url = replace_image_domain(original_img_url)
-                    proxy_preview_url = replace_image_domain(regular_img_url)
-                    
-                    return {
-                        "image_url": proxy_original_url,
-                        "pid": str(illust_id),
-                        "title": illust_body["title"],
-                        "author": illust_body["userName"],
-                        "author_id": illust_body["userId"],
-                        "work_url": f"https://www.pixiv.net/artworks/{illust_id}",
-                        "preview_url": proxy_preview_url,
-                        "original_url": original_img_url,
-                        "stats": {
-                            "bookmarks": selected.get("bookmarkCount", 0),
-                            "likes": selected.get("likeCount", 0),
-                            "views": selected.get("viewCount", 0)
-                        }
+                    # ===== 获取作品详情 =====
+                    illust_id = selected["id"]
+                    illust_url = f"https://www.pixiv.net/ajax/illust/{illust_id}"
+                    illust_headers = {
+                        **headers,
+                        "Referer": f"https://www.pixiv.net/artworks/{illust_id}",
+                        "X-Requested-With": "XMLHttpRequest"
                     }
-    except Exception as e:
-        raise Exception(f"搜索失败: {str(e)}")
+                    
+                    async with session.get(
+                        illust_url, 
+                        headers=illust_headers, 
+                        proxy=proxy, 
+                        timeout=20
+                    ) as illust_response:
+                        if illust_response.status != 200:
+                            raise Exception(f"获取作品详情失败: {illust_response.status}")
+                        
+                        illust_data = await illust_response.json()
+                        if illust_data.get("error"):
+                            raise Exception(f"作品详情错误: {illust_data.get('message', '未知错误')}")
+                        
+                        illust_body = illust_data["body"]
+                        
+                        # 二次R-18验证
+                        work_tags = [tag.get("tag", "").lower() 
+                                   for tag in illust_body.get("tags", {}).get("tags", [])]
+                        is_work_r18 = any(tag in ["r-18", "r18"] for tag in work_tags)
+                        is_work_r18g = any(tag in ["r-18g", "r18g"] for tag in work_tags)
+                        
+                        if not is_explicit_r18_request and (is_work_r18 or is_work_r18g):
+                            logger.warning(f"检测到R-18内容但未明确请求，跳过作品ID: {illust_id}")
+                            # 从候选列表中移除该作品并重试
+                            candidates = [item for item in candidates if item["id"] != illust_id]
+                            if candidates:
+                                continue  # 用剩余候选重试
+                            raise Exception("检测到不适当内容，已跳过。请尝试其他标签。")
+                        
+                        # ===== 构建返回结果 =====
+                        original_img_url = illust_body["urls"]["original"]
+                        regular_img_url = illust_body["urls"]["regular"]
+                        
+                        # 记录使用时间
+                        RECENT_IMAGES[str(illust_id)] = current_timestamp
+                        
+                        return {
+                            "image_url": replace_image_domain(original_img_url),
+                            "pid": str(illust_id),
+                            "title": illust_body["title"],
+                            "author": illust_body["userName"],
+                            "author_id": illust_body["userId"],
+                            "work_url": f"https://www.pixiv.net/artworks/{illust_id}",
+                            "preview_url": replace_image_domain(regular_img_url),
+                            "original_url": original_img_url,
+                            "stats": {
+                                "bookmarks": selected.get("bookmarkCount", 0),
+                                "likes": selected.get("likeCount", 0),
+                                "views": selected.get("viewCount", 0)
+                            },
+                            "strategy_used": strategy["name"]  # 记录使用的策略
+                        }
+        
+        except Exception as e:
+            logger.warning(f"策略[{strategy['name']}]执行失败: {str(e)}")
+            if strategy_idx == len(search_strategies) - 1:  # 最后一个策略也失败
+                raise Exception(f"所有搜索策略均失败: {str(e)}")
+            continue
+    
+    raise Exception("经过三阶段搜索仍未找到有效作品，请尝试调整标签组合")
 
 def replace_image_domain(url: str) -> str:
     """将Pixiv图片域名替换为代理域名，并确保文件格式兼容"""
