@@ -56,7 +56,7 @@ else:
     logger.warning("角色数据文件 character.json 不存在，将使用空数据")
 
 # ====== Nonebot2插件逻辑 ======
-pixiv_cmd = on_command("pixiv", aliases={"p"}, priority=5, block=True)
+pixiv_cmd = on_command("搜图", aliases={"p"}, priority=5, block=True)
 @pixiv_cmd.handle()
 async def handle_pixiv_command(bot: Bot, event: Event):
     """处理 /pixiv 命令 - 原图优先模式"""
@@ -230,51 +230,117 @@ async def handle_pixiv_command(bot: Bot, event: Event):
         await bot.send(event, f"❌ 搜索失败: {error_msg}")
 
 # ====== 新增：搜图帮助命令 ======
-help_cmd = on_command("搜图帮助", aliases={"help", "sotu"}, priority=5, block=True)
+help_cmd = on_command("搜图帮助", aliases={"sotu"}, priority=5, block=True)
 @help_cmd.handle()
 async def handle_help_command(bot: Bot, event: Event):
-    """处理 /搜图帮助 命令 - 查询角色昵称"""
-    # 获取命令参数（移除命令名）
-    args = event.get_plaintext().replace('/搜图帮助', '', 1).replace('搜图帮助', '', 1).strip()
+    """处理 /搜图帮助 [归属] [角色名] - 查询角色昵称"""
     
-    logger.debug(f"Received help command with args: '{args}'")
+    # 获取原始文本并移除命令前缀
+    raw_text = event.get_plaintext()
     
+    # 定义所有命令前缀
+    command_prefixes = [
+        "/搜图帮助", "搜图帮助",
+        "/sotu", "sotu"
+    ]
+    
+    # 移除命令前缀并获取参数
+    args = raw_text.strip()
+    for prefix in command_prefixes:
+        if args.startswith(prefix):
+            # 只移除第一个匹配的前缀
+            args = args[len(prefix):].strip()
+            break
+    
+    logger.debug(f"处理搜图帮助命令，参数: '{args}'")
+    
+    # 情况1: 无参数 - 显示所有归属
     if not args:
-        # 无参数，返回所有角色列表
         if not character_data:
-            await bot.send(event, "角色数据文件不存在或为空，请联系管理员添加角色数据")
+            await bot.send(event, "❌ 角色数据库为空，请联系管理员初始化数据")
             return
-            
-        # 获取所有角色中文名
-        roles = list(character_data.keys())
-        roles.sort()  # 按字母排序
         
-        # 构建角色列表消息
-        msg = "🎯 常见角色列表（输入 /搜图帮助 [角色名] 获取详细昵称）\n\n"
-        msg += "• " + "\n• ".join(roles[:20])  # 显示前20个角色
-        if len(roles) > 20:
-            msg += f"\n\n... 共 {len(roles)} 个角色（仅显示前20个）"
-        
+        franchises = sorted(character_data.keys())
+        msg = "📚 当前支持的作品归属:\n\n"
+        msg += "• " + "\n• ".join(f"「{f}」" for f in franchises)
+        msg += "\n\n💡 使用方法: /搜图帮助 [归属名] [角色名]"
         await bot.send(event, msg)
-    else:
-        # 有参数，查询特定角色
-        role_name = args
-        if role_name in character_data:
-            nicknames = character_data[role_name].get("别名", [])
-            if nicknames:
-                # 构建昵称列表消息
-                msg = f"🎭 角色: {role_name}\n\n"
-                msg += "• " + "\n• ".join(nicknames)
-                await bot.send(event, msg)
-            else:
-                await bot.send(event, f"角色 {role_name} 没有定义")
-        else:
-            # 尝试模糊匹配（如果需要）
-            matches = [r for r in character_data.keys() if role_name in r]
+        return
+
+    # 拆分参数 (最多两部分)
+    parts = args.split(maxsplit=1)
+    
+    # 情况2: 仅归属名 - 列出归属下的角色
+    if len(parts) == 1:
+        franchise = parts[0]
+        
+        # 验证归属是否存在
+        if franchise not in character_data:
+            # 尝试模糊匹配归属
+            matches = [f for f in character_data.keys() if franchise in f]
             if matches:
-                await bot.send(event, f"未找到精确匹配的角色 {role_name}，可能的匹配:\n• " + "\n• ".join(matches[:5]))
+                msg = f"⚠️ 未找到归属「{franchise}」，您可能想查询:\n"
+                msg += "• " + "\n• ".join(f"「{m}」" for m in matches[:3])
             else:
-                await bot.send(event, f"未找到角色 {role_name}，请检查输入")
+                msg = f"❌ 未找到归属「{franchise}」\n可用归属: {', '.join(character_data.keys())}"
+            await bot.send(event, msg)
+            return
+        
+        # 获取归属下的角色列表
+        franchise_data = character_data[franchise]
+        roles = sorted(franchise_data.keys())
+        
+        msg = f"🎭 归属「{franchise}」角色列表 ({len(roles)}个):\n\n"
+        msg += "• " + "\n• ".join(roles)
+        msg += f"\n\n🔍 查询别名: /搜图帮助 {franchise} [角色名]"
+        await bot.send(event, msg)
+        return
+
+    # 情况3: 归属 + 角色名 - 查询角色别名
+    franchise, character = parts
+    
+    # 验证归属
+    if franchise not in character_data:
+        matches = [f for f in character_data.keys() if franchise in f]
+        if matches:
+            msg = f"⚠️ 归属「{franchise}」不存在，推荐:\n"
+            msg += "• " + "\n• ".join(f"「{m}」" for m in matches[:3])
+        else:
+            msg = f"❌ 无效归属「{franchise}」，使用 /搜图帮助 查看可用归属"
+        await bot.send(event, msg)
+        return
+    
+    # 验证角色
+    franchise_data = character_data[franchise]
+    if character not in franchise_data:
+        # 在归属内模糊匹配角色
+        matches = [c for c in franchise_data.keys() if character in c]
+        if matches:
+            msg = f"🔍 在「{franchise}」中未找到「{character}」，推荐:\n"
+            msg += "• " + "\n• ".join(matches[:5])
+        else:
+            msg = f"❌ 「{franchise}」中不存在角色「{character}」"
+        await bot.send(event, msg)
+        return
+    
+    # 获取并展示别名
+    aliases = franchise_data[character].get("别名", [])
+    if not aliases:
+        await bot.send(event, f"ℹ️ 角色「{character}」(归属: {franchise}) 未设置别名")
+        return
+    
+    # 格式化别名列表
+    alias_list = []
+    for i, alias in enumerate(aliases, 1):
+        clean_alias = alias.strip().replace("  ", " ")
+        alias_list.append(f"{i}. {clean_alias}")
+    
+    msg = f"✅ 角色「{character}」别名列表\n"
+    msg += f"所属作品: {franchise}\n\n"
+    msg += "\n".join(alias_list)
+    msg += "\n\n💡 使用这些别名进行搜图效果更佳"
+    await bot.send(event, msg)
+
 
 # ====== 预览图处理函数（降级用） ======
 async def download_and_process_preview(image_url: str) -> bytes:
