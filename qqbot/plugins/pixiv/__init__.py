@@ -280,7 +280,7 @@ async def handle_help_command(bot: Bot, event: Event):
             matches = [f for f in character_data.keys() if franchise in f]
             if matches:
                 msg = f"⚠️ 未找到归属「{franchise}」，您可能想查询:\n"
-                msg += "• " + "\n• ".join(f"「{m}」" for m in matches[:3])
+                msg += "• " + "\n• ".join(f"「{m}」" for m in matches)
             else:
                 msg = f"❌ 未找到归属「{franchise}」\n可用归属: {', '.join(character_data.keys())}"
             await bot.send(event, msg)
@@ -304,7 +304,7 @@ async def handle_help_command(bot: Bot, event: Event):
         matches = [f for f in character_data.keys() if franchise in f]
         if matches:
             msg = f"⚠️ 归属「{franchise}」不存在，推荐:\n"
-            msg += "• " + "\n• ".join(f"「{m}」" for m in matches[:3])
+            msg += "• " + "\n• ".join(f"「{m}」" for m in matches)
         else:
             msg = f"❌ 无效归属「{franchise}」，使用 /搜图帮助 查看可用归属"
         await bot.send(event, msg)
@@ -317,7 +317,7 @@ async def handle_help_command(bot: Bot, event: Event):
         matches = [c for c in franchise_data.keys() if character in c]
         if matches:
             msg = f"🔍 在「{franchise}」中未找到「{character}」，推荐:\n"
-            msg += "• " + "\n• ".join(matches[:5])
+            msg += "• " + "\n• ".join(matches)
         else:
             msg = f"❌ 「{franchise}」中不存在角色「{character}」"
         await bot.send(event, msg)
