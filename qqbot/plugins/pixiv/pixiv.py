@@ -43,26 +43,33 @@ RECENT_IMAGES = {}  # {pid: last_used_time}
 
 # 创建日志
 logger = logging.getLogger('logger')
-logger.setLevel(logging.DEBUG)  # 设置最低日志级别
+logger.setLevel(logging.DEBUG)  
 
-# ====== PIXIV逻辑核心函数 (优化版) ======
+# ====== PIXIV逻辑核心函数 ======
 async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
-    """通过角色标签搜索Pixiv图片（智能适应新角色/冷门角色，三阶段重试策略）"""
+    """
+    TODO:
+    通过角色标签搜索Pixiv图片（智能适应新角色/冷门角色，三阶段重试策略）
+    策略1：精准模式 -> 满足最近90Day发布 + 收藏数 >= 500
+    策略2：宽松模式 -> 满足最近180Day发布 + 收藏数 >= 100
+    策略3：全站模式 -> 无限制搜索
+    """
     search_tag = " ".join(tags)
     encoded_tag = urllib.parse.quote(search_tag)
-    
+
     # ===== 检查是否明确请求R-18内容 =====
     is_explicit_r18_request = any(tag.lower() in ["r-18", "r18", "r-18g", "r18g"] for tag in tags)
     search_mode = "all" if is_explicit_r18_request else "safe"
-    
+
     # ===== 三阶段搜索策略配置 =====
+    # 构建搜索请求体
     search_strategies = [
         {
             "name": "精准模式(90天+高收藏)",
             "params": {
                 "scd": (datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d"),
                 "ecd": datetime.now().strftime("%Y-%m-%d"),
-                "blt": "200"  # 初始高质量阈值
+                "blt": "500"  # 初始高质量阈值
             }
         },
         {
@@ -81,7 +88,7 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
             }
         }
     ]
-    
+
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": f"https://www.pixiv.net/tags/{encoded_tag}/artworks",
@@ -92,17 +99,16 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
         "Sec-Fetch-Site": "same-origin",
         "X-Requested-With": "XMLHttpRequest"
     }
-    
+
     proxy = PROXY if USE_PROXY else None
     current_time = datetime.now(timezone.utc)
-    
+
     # ===== 三阶段重试策略 =====
     for strategy_idx, strategy in enumerate(search_strategies):
         try:
             # 为每次尝试生成新的随机偏移（扩大覆盖范围）
             offset = random.randint(0, 180)
             page = max(1, offset // 60 + 1)
-            
             url = f"https://www.pixiv.net/ajax/search/artworks/{encoded_tag}"
             params = {
                 "word": search_tag,
@@ -114,7 +120,6 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 "lang": "zh",
                 **strategy["params"]  # 合并当前策略参数
             }
-            
             async with aiohttp.ClientSession() as session:
                 # ===== 执行搜索请求 =====
                 async with session.get(
@@ -148,8 +153,8 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                         if isinstance(tags_info, dict):
                             tags_info = tags_info.get("tags", [])
                         
-                        tag_names = [tag.get("tag", "").lower() 
-                                   for tag in tags_info 
+                        tag_names = [tag.get("tag", "").lower()
+                                   for tag in tags_info
                                    if isinstance(tag, dict)]
                         
                         # 检测R-18内容
