@@ -42,7 +42,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 RECENT_IMAGES = {}  # {pid: last_used_time}
 
 # 创建日志
-logger = logging.getLogger('logger')
+logger = logging.getLogger()
 logger.setLevel(logging.DEBUG)  
 
 # ====== PIXIV逻辑核心函数 ======
@@ -396,7 +396,6 @@ async def compress_image(file_path: Path, max_size: int = 10 * 1024 * 1024) -> P
     if not PILLLOW_AVAILABLE:
         logger.warning("Pillow库未安装，无法压缩图片")
         return None
-    
     try:
         # 读取图片
         with Image.open(file_path) as img:
@@ -415,16 +414,13 @@ async def compress_image(file_path: Path, max_size: int = 10 * 1024 * 1024) -> P
                 img.save(buffer, format="JPEG", quality=quality, optimize=True)
                 buffer.seek(0)
                 compressed_size = buffer.tell()
-                
                 # 如果压缩后的大小符合要求，保存并返回
                 if compressed_size <= max_size:
                     new_file_path = file_path.with_suffix('.jpg')
                     with open(new_file_path, 'wb') as f:
                         f.write(buffer.read())
                     return new_file_path
-                
                 quality -= 5
-            
             # 如果压缩到最低质量仍然太大，使用预览图
             return None
     except Exception as e:
@@ -434,36 +430,36 @@ async def compress_image(file_path: Path, max_size: int = 10 * 1024 * 1024) -> P
 async def download_original_image(url: str) -> Path:
     """安全下载大文件到临时位置，返回文件路径（确保不超过10MB）"""
     file_size = await get_remote_file_size(url)
-    
+
     # 生成唯一文件名
     timestamp = int(time.time() * 1000)
     random_str = ''.join(random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=8))
     parsed_url = urllib.parse.urlparse(url)
     ext = os.path.splitext(parsed_url.path)[1] or '.jpg'
-    
+
     # 确保文件扩展名兼容
     ext = ext.lower()
     if ext in ['.webp', '.avif', '.heic']:
         ext = '.jpg'
     elif ext == '.svg':
         ext = '.png'
-    
+
     filename = f"pixiv_{timestamp}_{random_str}{ext}"
     temp_path = TEMP_DIR / filename
-    
+
     logger.info(f"开始下载原图到: {temp_path} (预估大小: {file_size/1024/1024:.2f}MB)")
-    
+
     proxy = PROXY if USE_PROXY else None
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://www.pixiv.net/"
     }
-    
+
     # 创建SSL上下文（避免SSL验证问题）
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
-    
+
     # 重试机制
     for attempt in range(MAX_ATTEMPTS):
         try:
@@ -474,7 +470,7 @@ async def download_original_image(url: str) -> Path:
                     if response.status != 200:
                         error_text = await response.text()
                         raise Exception(f"下载失败，状态码: {response.status}, 响应: {error_text[:200]}")
-                    
+
                     # 分块写入文件，避免内存溢出
                     total_bytes = 0
                     start_time = time.time()
@@ -482,12 +478,12 @@ async def download_original_image(url: str) -> Path:
                         async for chunk in response.content.iter_chunked(MAX_DOWNLOAD_CHUNK):
                             await f.write(chunk)
                             total_bytes += len(chunk)
-                    
+
                     # 验证文件完整性
                     downloaded_size = temp_path.stat().st_size
                     if file_size > 0 and downloaded_size < file_size * 0.9:
                         raise Exception(f"文件不完整: 期望 {file_size} 字节, 实际 {downloaded_size} 字节")
-                    
+
                     # 验证图片有效性（需要Pillow）
                     try:
                         if PILLLOW_AVAILABLE:
@@ -502,7 +498,7 @@ async def download_original_image(url: str) -> Path:
                             new_path = temp_path.with_suffix('.jpg')
                             temp_path.rename(new_path)
                             temp_path = new_path
-                    
+
                     # 检查文件大小并压缩（如果需要）
                     if downloaded_size > 10 * 1024 * 1024:  # 超过10MB
                         logger.warning(f"⚠️ 图片过大 ({downloaded_size/1024/1024:.1f}MB)，尝试压缩...")
@@ -513,7 +509,7 @@ async def download_original_image(url: str) -> Path:
                         else:
                             logger.warning("⚠️ 图片压缩失败，将使用预览图")
                             return None  # 返回None表示需要使用预览图
-                    
+
                     logger.info(f"✅ 原图下载成功: {downloaded_size/1024/1024:.2f}MB, 耗时: {time.time()-start_time:.1f}s")
                     return temp_path
         except Exception as e:

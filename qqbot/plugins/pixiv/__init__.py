@@ -12,10 +12,10 @@ from nonebot.adapters.onebot.v11 import MessageSegment, Bot, Event
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
+logger = logging.getLogger()
+logging.basicConfig(level = logging.INFO,format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-# 创建日志
-logger = logging.getLogger('logger')
-logger.setLevel(logging.DEBUG)  # 设置最低日志级别
+
 
 # 导入Pixiv逻辑
 from .pixiv import (
@@ -63,7 +63,6 @@ async def handle_pixiv_command(bot: Bot, event: Event):
     # ===== 新增：冷却机制检查 =====
     user_id = event.get_user_id()
     current_time = time.time()
-    
     # 检查是否在冷却中
     if user_id in last_request_time:
         elapsed = current_time - last_request_time[user_id]
@@ -71,25 +70,20 @@ async def handle_pixiv_command(bot: Bot, event: Event):
             remaining = COOLDOWN_TIME - elapsed
             await bot.send(event, f"请求过于频繁，请等待 {remaining:.1f} 秒后再试")
             return
-    
     # 更新最后请求时间
     last_request_time[user_id] = current_time
-    
     raw_message = str(event.get_message()).strip()
     command_str = event.get_plaintext().split()[0]
     args = raw_message[len(command_str):].strip()
-    
     if not args:
         await bot.send(event, "请提供搜索标签，例如：\n/pixiv 鸣潮\n/p 鸣潮")
         return
-    
     tags = [tag.strip() for tag in args.split() if tag.strip()]
     logger.info(f"Pixiv搜索请求: {tags}")
-    
+
     try:
         # 1. 搜索作品
         result = await search_pixiv_by_tag(tags)
-        
         # 2. 构建消息内容
         msg_content = (
             f"🎨 作品标题: {result['title']}\n"
@@ -98,25 +92,21 @@ async def handle_pixiv_command(bot: Bot, event: Event):
             f"🔗 作品链接: {result['work_url']}\n\n"
             f"⏳ 正在下载原图 (可能需要较长时间)..."
         )
-        
         # 发送初步信息
         await bot.send(event, msg_content)
-        
+
         # 3. 安全下载原图
         try:
             # 清理旧临时文件
             await cleanup_temp_files()
-            
             # 下载原图
             file_path = await download_original_image(result['image_url'])
-            
             # 检查文件是否存在
             if not file_path or not file_path.exists():
                 if file_path is None:
                     logger.warning("⚠️ 原图压缩失败，将使用预览图")
                 else:
                     raise FileNotFoundError(f"文件不存在: {file_path}")
-                
                 # 降级发送预览图
                 fallback_msg = (
                     f"⚠️ 原图过大或压缩失败，已自动降级为预览图\n"
@@ -124,7 +114,6 @@ async def handle_pixiv_command(bot: Bot, event: Event):
                     f"🖼️ 当前显示预览图（点击链接下载原图）:"
                 )
                 await bot.send(event, fallback_msg)
-                
                 # 发送预览图
                 preview_data = await download_and_process_preview(result['preview_url'])
                 await bot.send(event, MessageSegment.image(preview_data))
