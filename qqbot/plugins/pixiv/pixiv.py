@@ -43,7 +43,7 @@ RECENT_IMAGES = {}  # {pid: last_used_time}
 
 # 创建日志
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)  
+logging.basicConfig(level = logging.INFO,format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 # ====== PIXIV逻辑核心函数 ======
 async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
@@ -401,11 +401,9 @@ async def compress_image(file_path: Path, max_size: int = 10 * 1024 * 1024) -> P
         with Image.open(file_path) as img:
             # 获取原始尺寸
             width, height = img.size
-            
             # 如果图片已经小于10MB，直接返回
             if file_path.stat().st_size <= max_size:
                 return file_path
-            
             # 尝试压缩图片
             quality = 95
             while quality > 50 and file_path.stat().st_size > max_size:
