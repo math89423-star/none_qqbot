@@ -260,14 +260,14 @@ async def handle_help_command(bot: Bot, event: Event):
         # 有参数，查询特定角色
         role_name = args
         if role_name in character_data:
-            nicknames = character_data[role_name].get("昵称", [])
+            nicknames = character_data[role_name].get("别名", [])
             if nicknames:
                 # 构建昵称列表消息
                 msg = f"🎭 角色: {role_name}\n\n"
                 msg += "• " + "\n• ".join(nicknames)
                 await bot.send(event, msg)
             else:
-                await bot.send(event, f"角色 {role_name} 没有定义昵称")
+                await bot.send(event, f"角色 {role_name} 没有定义")
         else:
             # 尝试模糊匹配（如果需要）
             matches = [r for r in character_data.keys() if role_name in r]
