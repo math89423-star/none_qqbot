@@ -3,32 +3,27 @@ import asyncio
 import traceback
 import time
 import logging
-import aiohttp
 import aiofiles
 import json  
-from nonebot import on_command, logger, get_driver
+from nonebot import on_command, logger
 from nonebot.adapters.onebot.v11 import MessageSegment, Bot, Event
-from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from .config.config import COOLDOWN_TIME, PROXY, PROXY_URL
-
-logger = logging.getLogger()
-logging.basicConfig(level = logging.INFO,format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-
-# 导入Pixiv逻辑
-from .pixiv import (
+from .config.config import (
+    COOLDOWN_TIME, 
+    PROXY, 
+    PROXY_URL
+)
+from .api.pixiv_api import (
     search_pixiv_by_tag,
     download_original_image,
-    cleanup_temp_files
+    cleanup_temp_files,
+    download_and_process_preview
 )
-
-
+# 创建日志
+logger = logging.getLogger()
+logging.basicConfig(level = logging.INFO,format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 # 请求冷却机制
-last_request_time = {}  # {user_id: last_request_time}
-
-
-# ====== 新增：角色昵称数据加载 ======
-# 尝试加载角色数据文件
+last_request_time = {}
+# 加载角色数据文件
 character_data = {}
 config_dir = os.path.dirname(os.path.abspath(__file__))
 character_file = os.path.join(config_dir, 'character.json')
@@ -43,7 +38,7 @@ if os.path.exists(character_file):
 else:
     logger.warning("角色数据文件 character.json 不存在，将使用空数据")
 
-# ====== Nonebot2插件逻辑 ======
+# 核心command命令
 pixiv_cmd = on_command("搜图", aliases={"p"}, priority=5, block=True)
 @pixiv_cmd.handle()
 async def handle_pixiv_command(bot: Bot, event: Event):
@@ -68,7 +63,6 @@ async def handle_pixiv_command(bot: Bot, event: Event):
         return
     tags = [tag.strip() for tag in args.split() if tag.strip()]
     logger.info(f"Pixiv搜索请求: {tags}")
-
     try:
         # 1. 搜索作品
         result = await search_pixiv_by_tag(tags)
@@ -82,7 +76,6 @@ async def handle_pixiv_command(bot: Bot, event: Event):
         )
         # 发送初步信息
         await bot.send(event, msg_content)
-
         # 3. 安全下载原图
         try:
             # 清理旧临时文件
@@ -106,7 +99,6 @@ async def handle_pixiv_command(bot: Bot, event: Event):
                 preview_data = await download_and_process_preview(result['preview_url'])
                 await bot.send(event, MessageSegment.image(preview_data))
                 return
-            
             # 检查文件大小
             file_size = file_path.stat().st_size
             if file_size > 10 * 1024 * 1024:  # 超过10MB
@@ -117,15 +109,12 @@ async def handle_pixiv_command(bot: Bot, event: Event):
                     f"🖼️ 当前显示预览图（点击链接下载原图）:"
                 )
                 await bot.send(event, fallback_msg)
-                
                 # 发送预览图
                 preview_data = await download_and_process_preview(result['preview_url'])
                 await bot.send(event, MessageSegment.image(preview_data))
                 return
-            
             # 发送原图
             logger.info(f"准备发送文件路径: {file_path}")
-            
             start_time = time.time()
             # 读取文件内容
             try:
@@ -134,7 +123,7 @@ async def handle_pixiv_command(bot: Bot, event: Event):
                 await bot.send(event, MessageSegment.image(image_data))
                 logger.info(f"✅ 原图发送成功! 耗时: {time.time()-start_time:.1f}s")
             except Exception as e:
-                logger.error(f"发送失败: {str(e)}")
+                logger.info(f"发送失败: {str(e)}")
                 raise e
             # 4. 同步清理文件（确保发送完成后再删除）
             try:
@@ -145,11 +134,9 @@ async def handle_pixiv_command(bot: Bot, event: Event):
                     logger.debug(f"✅ 已清理临时文件: {file_path}")
             except Exception as e:
                 logger.warning(f"清理文件警告 {file_path}: {str(e)}")
-        
         except Exception as e:
             error_msg = str(e)
-            logger.error(f"原图发送失败: {error_msg}\n{traceback.format_exc()}")
-            
+            logger.info(f"原图发送失败: {error_msg}\n{traceback.format_exc()}")
             # 降级方案：发送预览图 + 原图链接
             fallback_msg = (
                 f"⚠️ 原图发送失败（可能文件过大或网络问题），已自动降级\n"
@@ -157,15 +144,12 @@ async def handle_pixiv_command(bot: Bot, event: Event):
                 f"🖼️ 当前显示预览图（点击链接下载原图）:"
             )
             await bot.send(event, fallback_msg)
-            
             # 发送预览图
             preview_data = await download_and_process_preview(result['preview_url'])
             await bot.send(event, MessageSegment.image(preview_data))
-    
     except Exception as e:
         error_msg = str(e)
-        logger.error(f"Pixiv搜索失败: {error_msg}\n{traceback.format_exc()}")
-        
+        logger.info(f"Pixiv搜索失败: {error_msg}\n{traceback.format_exc()}")
         # 优化错误提示
         if "Cookie" in error_msg or "cookie" in error_msg.lower():
             error_msg = (
@@ -203,24 +187,20 @@ async def handle_pixiv_command(bot: Bot, event: Event):
             )
         else:
             error_msg = f"发生未知错误: {error_msg}"
-        
         await bot.send(event, f"❌ 搜索失败: {error_msg}")
 
-# ====== 新增：搜图帮助命令 ======
+# 搜图帮助命令
 help_cmd = on_command("搜图帮助", aliases={"sotu"}, priority=5, block=True)
 @help_cmd.handle()
 async def handle_help_command(bot: Bot, event: Event):
     """处理 /搜图帮助 [归属] [角色名] - 查询角色昵称"""
-    
     # 获取原始文本并移除命令前缀
     raw_text = event.get_plaintext()
-    
     # 定义所有命令前缀
     command_prefixes = [
         "/搜图帮助", "搜图帮助",
         "/sotu", "sotu"
     ]
-    
     # 移除命令前缀并获取参数
     args = raw_text.strip()
     for prefix in command_prefixes:
@@ -228,29 +208,23 @@ async def handle_help_command(bot: Bot, event: Event):
             # 只移除第一个匹配的前缀
             args = args[len(prefix):].strip()
             break
-    
     logger.debug(f"处理搜图帮助命令，参数: '{args}'")
-    
     # 情况1: 无参数 - 显示所有归属
     if not args:
         if not character_data:
             await bot.send(event, "❌ 角色数据库为空，请联系管理员初始化数据")
             return
-        
         franchises = sorted(character_data.keys())
         msg = "📚 当前支持的作品归属:\n\n"
         msg += "• " + "\n• ".join(f"「{f}」" for f in franchises)
         msg += "\n\n💡 使用方法: /搜图帮助 [归属名] [角色名]"
         await bot.send(event, msg)
         return
-
     # 拆分参数 (最多两部分)
     parts = args.split(maxsplit=1)
-    
     # 情况2: 仅归属名 - 列出归属下的角色
     if len(parts) == 1:
         franchise = parts[0]
-        
         # 验证归属是否存在
         if franchise not in character_data:
             # 尝试模糊匹配归属
@@ -262,20 +236,16 @@ async def handle_help_command(bot: Bot, event: Event):
                 msg = f"❌ 未找到归属「{franchise}」\n可用归属: {', '.join(character_data.keys())}"
             await bot.send(event, msg)
             return
-        
         # 获取归属下的角色列表
         franchise_data = character_data[franchise]
         roles = sorted(franchise_data.keys())
-        
         msg = f"🎭 归属「{franchise}」角色列表 ({len(roles)}个):\n\n"
         msg += "• " + "\n• ".join(roles)
         msg += f"\n\n🔍 查询别名: /搜图帮助 {franchise} [角色名]"
         await bot.send(event, msg)
         return
-
     # 情况3: 归属 + 角色名 - 查询角色别名
     franchise, character = parts
-    
     # 验证归属
     if franchise not in character_data:
         matches = [f for f in character_data.keys() if franchise in f]
@@ -286,7 +256,6 @@ async def handle_help_command(bot: Bot, event: Event):
             msg = f"❌ 无效归属「{franchise}」，使用 /搜图帮助 查看可用归属"
         await bot.send(event, msg)
         return
-    
     # 验证角色
     franchise_data = character_data[franchise]
     if character not in franchise_data:
@@ -299,43 +268,18 @@ async def handle_help_command(bot: Bot, event: Event):
             msg = f"❌ 「{franchise}」中不存在角色「{character}」"
         await bot.send(event, msg)
         return
-    
     # 获取并展示别名
     aliases = franchise_data[character].get("别名", [])
     if not aliases:
         await bot.send(event, f"ℹ️ 角色「{character}」(归属: {franchise}) 未设置别名")
         return
-    
     # 格式化别名列表
     alias_list = []
     for i, alias in enumerate(aliases, 1):
         clean_alias = alias.strip().replace("  ", " ")
         alias_list.append(f"{i}. {clean_alias}")
-    
     msg = f"✅ 角色「{character}」别名列表\n"
     msg += f"所属作品: {franchise}\n\n"
     msg += "\n".join(alias_list)
     msg += "\n\n💡 使用这些别名进行搜图效果更佳"
     await bot.send(event, msg)
-
-
-# ====== 预览图处理函数（降级用） ======
-async def download_and_process_preview(image_url: str) -> bytes:
-    """下载并处理预览图（小尺寸）"""
-    try:
-        proxy = PROXY if USE_PROXY else None
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": "https://www.pixiv.net/"
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                image_url, headers=headers, proxy=proxy, timeout=aiohttp.ClientTimeout(total=15)
-            ) as response:
-                if response.status != 200:
-                    raise Exception(f"预览图下载失败，状态码: {response.status}")
-                return await response.read()
-    except Exception as e:
-        logger.error(f"预览图处理失败: {str(e)}")
-        raise Exception(f"预览图处理失败: {str(e)}")

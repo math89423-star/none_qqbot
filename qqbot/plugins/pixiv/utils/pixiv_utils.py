@@ -6,7 +6,13 @@ import threading
 from http import HTTPStatus
 from datetime import datetime, timedelta, timezone
 from .error_utils import PixivAPIError
-from ..config.config import PIXIV_COOKIE, PROXY, PROXY_URL, USE_PROXY, EXCLUDE_DURATION
+from ..config.config import (
+    PIXIV_COOKIE, 
+    PROXY, 
+    PROXY_URL, 
+    USE_PROXY, 
+    EXCLUDE_DURATION
+)
 
 RECENT_IMAGES = {}
 # 添加全局锁
