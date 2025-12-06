@@ -4,6 +4,7 @@ import aiohttp
 import time
 import threading
 import math
+import logging
 from http import HTTPStatus
 from datetime import datetime, timedelta, timezone
 from .error_utils import PixivAPIError
@@ -14,6 +15,10 @@ from ..config.config import (
     USE_PROXY, 
     EXCLUDE_DURATION
 )
+
+# 创建日志
+logger = logging.getLogger()
+logging.basicConfig(level = logging.INFO,format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 RECENT_IMAGES = {}
 # 添加全局锁
@@ -33,19 +38,25 @@ def _build_search_strategies() -> list:
                 "scd": (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d"),
                 "ecd": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                 "blt": "500"
-            }
+            },
+            "page": 1,  # 精准模式固定第一页
+            "mode": "s_tag"  # 明确搜索模式
         },
         {
-            "name": "宽松模式(180天+中收藏)",
+            "name": "宽松模式(360天+中收藏)",
             "params": {
-                "scd": (datetime.now(timezone.utc) - timedelta(days=180)).strftime("%Y-%m-%d"),
+                "scd": (datetime.now(timezone.utc) - timedelta(days=360)).strftime("%Y-%m-%d"),
                 "ecd": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
                 "blt": "100"
-            }
+            },
+            "page_range": (1, 3),  # 1-3页
+            "mode": "s_tag"
         },
         {
             "name": "全站模式(无限制)",
-            "params": {"blt": "0"}
+            "params": {},
+            "page_range": (1, 5),  # 1-5页
+            "mode": "s_tag"
         }
     ]
 
@@ -67,25 +78,30 @@ async def _execute_search_strategy(
     search_tag: str,
     encoded_tag: str,
     strategy: dict,
-    search_mode: str
 ) -> list:
     """执行单次搜索策略并返回原始结果列表"""
     headers = _build_pixiv_headers(search_tag)
     proxy = PROXY if USE_PROXY else None
-    # 生成随机偏移
-    offset = random.randint(0, 180)
-    page = max(1, offset // 60 + 1)
+       # 从策略获取页码 (精准模式固定第一页)
+    if "page" in strategy:
+        page = strategy["page"]
+    else:
+        page_range = strategy.get("page_range", (1, 3))
+        page = random.randint(*page_range)
+    # 从策略获取搜索模式
+    search_mode = strategy.get("mode", "s_tag")
     params = {
         "word": search_tag,
-        "order": "popular_d",
+        "order": "popular_d",  # 按受欢迎度排序
         "mode": search_mode,
         "p": page,
-        "s_mode": "s_tag",
+        "s_mode": "s_tag",     # 标签完全匹配
         "type": "all",
         "lang": "zh",
         **strategy["params"]
     }
-    # 发送搜索请求
+    # 添加调试日志
+    logger.debug(f"请求策略: {strategy['name']}, 页码: {page}, 参数: {params}")
     async with aiohttp.ClientSession() as session, \
         session.get(
             f"https://www.pixiv.net/ajax/search/artworks/{encoded_tag}",
@@ -93,18 +109,18 @@ async def _execute_search_strategy(
             params=params,
             proxy=proxy,
             timeout=30
-        ) as response:  # 合并写法
+        ) as response:
             if response.status != HTTPStatus.OK:
                 raise PixivAPIError(
                     error_type = "api_failure",
-                    strategy_name=strategy['name'],
+                    strategy_name = strategy['name'],
                     details={"status": response.status}
                 )
             data = await response.json()
             if not data.get("body") or not data["body"].get("illustManga", {}).get("data"):
                 raise PixivAPIError(
                     error_type = "empty_data",
-                    strategy_name=strategy['name'],
+                    strategy_name = strategy['name'],
                     details={"status": response.status}
                 )
             return data["body"]["illustManga"]["data"]

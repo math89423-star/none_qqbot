@@ -12,7 +12,9 @@ from http import HTTPStatus
 from pathlib import Path
 from PIL import Image
 from ..utils.pixiv_utils import (
-    _is_r18_request, 
+    _is_r18_request,
+    _is_r18_content,
+    _extract_tag_names,
     _build_search_strategies,
     _execute_search_strategy,
     _select_best_image,
@@ -53,17 +55,28 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     strategies = _build_search_strategies()
     # 3. 三阶段搜索重试
     for strategy in strategies:
-        try:
-            # 4. 执行单次策略搜索
-            results = await _execute_search_strategy(
-                search_tag, encoded_tag, strategy, search_mode
-            )
-            # 5. 处理结果并选择作品
-            selected = _select_best_image(results, is_explicit_r18_request)
-            # 6. 获取作品详情并验证
-            return await _validate_and_build_response(selected, is_explicit_r18_request, encoded_tag)
-        except Exception as e:
-            logger.warning(f"策略[{strategy['name']}]失败: {str(e)}")
+        for attempt in range(3):  # 每个策略最多尝试3次
+            try:
+                # 4. 执行策略搜索
+                results = await _execute_search_strategy(
+                    search_tag, encoded_tag, strategy
+                )
+                filtered_results = [r for r in results if not _is_r18_content(_extract_tag_names(r)) or is_explicit_r18_request]
+                if not filtered_results and not is_explicit_r18_request:
+                    # 非R-18请求但全是R-18内容，调整策略参数
+                    logger.info(f"策略[{strategy['name']}]全是R-18内容，调整参数重试")
+                    strategy["params"]["mode"] = "safe"  # 添加安全模式参数
+                    continue  # 重试当前策略
+                # 5. 处理结果并选择作品
+                selected = _select_best_image(results, is_explicit_r18_request)
+                # 6. 获取作品详情并验证
+                return await _validate_and_build_response(
+                    selected, is_explicit_r18_request, encoded_tag
+                )
+            except Exception as e:
+                logger.warning(f"策略[{strategy['name']}]尝试#{attempt+1}失败: {str(e)}")
+                if attempt == 1 or strategy is strategies[-1]:
+                    break
             if strategy is strategies[-1]:
                 raise Exception(f"所有搜索策略均失败: {str(e)}")
     raise Exception("三阶段搜索全部失败")
