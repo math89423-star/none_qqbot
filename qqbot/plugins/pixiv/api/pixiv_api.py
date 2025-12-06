@@ -19,7 +19,9 @@ from ..utils.pixiv_utils import (
     _execute_search_strategy,
     _select_best_image,
     _validate_and_build_response,
-    _cleanup_recent_images
+    _cleanup_recent_images,
+    _find_optimal_size,
+    _fine_tune_quality
 )
 from ..config.config import (
     PROXY,
@@ -57,7 +59,7 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     strategies = _build_search_strategies()
     # 4. 三阶段搜索重试
     for strategy in strategies:
-        for attempt in range(5):  # 每个策略最多尝试5次
+        for attempt in range(8):  # 每个策略最多尝试8次
             try:
                 # 5. 执行策略搜索
                 results = await _execute_search_strategy(
@@ -68,9 +70,14 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 for r in results:
                     # 检查图片ID是否在缓存中（如果缓存为空，跳过ID检查）
                     if RECENT_IMAGES and 'illust_id' in r:
-                        image_id = str(r['illust_id'])
+                        # 关键修复：将ID转换为整数，而非字符串
+                        try:
+                            image_id = int(r['illust_id'])
+                        except (TypeError, ValueError):
+                            continue  # 无效ID，跳过
                         if image_id in RECENT_IMAGES:
                             continue  # 已缓存，跳过
+
                     # 修复R-18过滤逻辑：非R-18请求时排除R-18内容
                     if not is_explicit_r18_request and _is_r18_content(_extract_tag_names(r)):
                         continue  # 非R-18请求时排除R-18内容
@@ -89,7 +96,11 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 )
                 # 10. 添加新图片ID到缓存
                 if selected and 'illust_id' in selected:
-                    image_id = str(selected['illust_id'])
+                    try:
+                        image_id = int(selected['illust_id'])
+                    except (TypeError, ValueError):
+                        # 无效ID，不添加到缓存
+                        continue
                     RECENT_IMAGES[image_id] = time.time()
                     # 限制缓存大小
                     if len(RECENT_IMAGES) > 500:
@@ -98,11 +109,10 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 return result
             except Exception as e:
                 logger.warning(f"策略[{strategy['name']}]尝试#{attempt+1}失败: {str(e)}")
-                if attempt == 4 or (strategy is strategies[-1] and attempt >= 1):
+                if attempt == 7:
                     break
         else:
             continue
-        break
     raise Exception("所有搜索策略均失败或搜索均命中限制级内容请重试")
 
 async def get_remote_file_size(url: str) -> int:
@@ -143,29 +153,33 @@ async def get_remote_file_size(url: str) -> int:
         return 0
 
 async def compress_image(file_path: Path, max_size: int = 10 * 1024 * 1024) -> Path:
-    """智能压缩图片，最大化利用10MB上限保持质量"""
+    """智能压缩图片，最大化利用10MB上限保持质量（已修复EXIF问题）"""
     try:
         original_size = file_path.stat().st_size
         if original_size <= max_size:
             return file_path
         logger.warning(f"⚠️ 图片过大 ({original_size/1024/1024:.2f}MB)，开始智能压缩...")
         with Image.open(file_path) as img:
+            # 🔥 关键修复1：强制移除EXIF数据（避免过长问题）
+            if 'exif' in img.info:
+                del img.info['exif']
             # 1. 预处理：转换为RGB
             if img.mode in ('RGBA', 'LA', 'P'):
                 background = Image.new('RGB', img.size, (255, 255, 255))
                 background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
                 img = background
             orig_width, orig_height = img.size
-            target_size_range = (max_size * 0.9, max_size * 0.98)  # 目标范围: 9-9.8MB
-            # 2. 阶段1: 尺寸优化 - 找到最佳尺寸
+            target_size_range = (max_size * 0.95, max_size * 0.98)  # 更宽松的目标范围
+            # 2. 阶段1: 尺寸优化
             optimal_img = await _find_optimal_size(img, orig_width, orig_height, target_size_range)
-            # 3. 阶段2: 质量微调 - 在最佳尺寸基础上调整质量
+            # 3. 阶段2: 质量微调（关键优化）
             result = await _fine_tune_quality(optimal_img, target_size_range)
-            # 4. 保存最终结果
             if result:
                 compressed_img, best_quality, compressed_size = result
                 new_file_path = file_path.with_name(f"{file_path.stem}_compressed.jpg")
+                # 🔥 关键修复2：保存时不再传递exif（已移除EXIF）
                 with open(new_file_path, 'wb') as f:
+                    compressed_img.seek(0)
                     f.write(compressed_img.getvalue())
                 logger.info(
                     f"✅ 压缩成功: {original_size/1024/1024:.2f}MB → "
@@ -178,101 +192,6 @@ async def compress_image(file_path: Path, max_size: int = 10 * 1024 * 1024) -> P
     except Exception as e:
         logger.error(f"图片压缩失败: {str(e)}", exc_info=True)
         return None
-
-async def _find_optimal_size(img, orig_width, orig_height, target_size_range):
-    """找到最佳尺寸，使95%质量的JPEG接近目标大小范围"""
-    min_size, max_size = target_size_range
-    current_img = img.copy()
-    # 1. 先测试原始尺寸
-    buffer = io.BytesIO()
-    current_img.save(buffer, format="JPEG", quality=95, optimize=True, progressive=True)
-    current_size = buffer.tell()
-    # 2. 如果原始尺寸在目标范围内，直接返回
-    if min_size <= current_size <= max_size:
-        logger.info(f"🎯 原始尺寸完美匹配目标: {current_size/1024/1024:.2f}MB")
-        return current_img
-    # 3. 如果原始尺寸太大，缩小
-    if current_size > max_size:
-        scale = 0.9  # 缩小比例
-        while current_size > max_size and scale > 0.5:
-            new_width = int(orig_width * scale)
-            new_height = int(orig_height * scale)
-            resized_img = img.resize((new_width, new_height), Image.LANCZOS)
-            buffer = io.BytesIO()
-            resized_img.save(buffer, format="JPEG", quality=95, optimize=True, progressive=True)
-            current_size = buffer.tell()
-            logger.debug(f"🔍 尺寸测试: {new_width}x{new_height} → {current_size/1024/1024:.2f}MB")
-            if min_size <= current_size <= max_size:
-                logger.info(f"🎯 找到完美尺寸: {new_width}x{new_height} ({current_size/1024/1024:.2f}MB)")
-                return resized_img
-            scale -= 0.05
-        logger.info(f"📏 尺寸缩小至: {current_img.size[0]}x{current_img.size[1]} ({current_size/1024/1024:.2f}MB)")
-        return current_img
-    # 4. 如果原始尺寸太小，尝试增大（仅当原始尺寸小于目标时）
-    if current_size < min_size and orig_width < 4096 and orig_height < 4096:
-        scale = 1.1  # 增大比例
-        best_img = current_img.copy()
-        best_size = current_size
-        while current_size < max_size and scale <= 1.5:
-            new_width = min(int(orig_width * scale), 4096)
-            new_height = min(int(orig_height * scale), 4096)
-            resized_img = img.resize((new_width, new_height), Image.LANCZOS)
-            buffer = io.BytesIO()
-            resized_img.save(buffer, format="JPEG", quality=95, optimize=True, progressive=True)
-            current_size = buffer.tell()
-            logger.debug(f"🔍 尺寸放大测试: {new_width}x{new_height} → {current_size/1024/1024:.2f}MB")
-            if current_size <= max_size:
-                best_img = resized_img
-                best_size = current_size
-            if min_size <= current_size <= max_size:
-                logger.info(f"🎯 找到完美放大尺寸: {new_width}x{new_height} ({current_size/1024/1024:.2f}MB)")
-                return resized_img
-            scale += 0.1
-        if best_size > current_size:  # 如果有改进
-            logger.info(f"📈 尺寸优化至: {best_img.size[0]}x{best_img.size[1]} ({best_size/1024/1024:.2f}MB)")
-            return best_img
-    return current_img
-
-async def _fine_tune_quality(img, target_size_range):
-    """在最佳尺寸基础上微调质量，精确匹配目标大小"""
-    min_size, max_size = target_size_range
-    # 1. 先测试95%质量
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=95, optimize=True, progressive=True)
-    current_size = buffer.tell()
-    # 2. 如果已经接近目标，直接返回
-    if min_size <= current_size <= max_size:
-        return buffer, 95, current_size
-    # 3. 如果太大，降低质量
-    if current_size > max_size:
-        low, high = 70, 95
-        best_quality = 90
-        best_buffer = None
-        for _ in range(8):
-            mid = (low + high) // 2
-            buffer = io.BytesIO()
-            img.save(buffer, format="JPEG", quality=mid, optimize=True, progressive=True)
-            size = buffer.tell()
-            logger.debug(f"🔍 质量微调: {mid}% → {size/1024/1024:.2f}MB")
-            if size <= max_size:
-                best_quality = mid
-                best_buffer = buffer
-                low = mid + 1
-            else:
-                high = mid - 1
-        if best_buffer and best_buffer.tell() >= min_size:
-            return best_buffer, best_quality, best_buffer.tell()
-    # 4. 如果太小，尝试添加元数据增加文件大小（无损）
-    elif current_size < min_size:
-        # 添加EXIF元数据（无损增加文件大小）
-        exif_data = b" " * int(min_size - current_size)
-        buffer = io.BytesIO()
-        img.save(buffer, format="JPEG", quality=95, optimize=True, progressive=True, exif=exif_data)
-        if buffer.tell() <= max_size:
-            logger.info(f"🏷️ 通过EXIF元数据优化文件大小: {current_size/1024/1024:.2f}MB → {buffer.tell()/1024/1024:.2f}MB")
-            return buffer, 95, buffer.tell()
-    # 5. 返回最接近的结果
-    return buffer, 95, current_size
 
 async def download_original_image(url: str) -> Path:
     """安全下载大文件到临时位置，返回文件路径（确保不超过10MB）"""
