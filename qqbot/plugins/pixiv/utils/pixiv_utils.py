@@ -319,3 +319,10 @@ async def _validate_and_build_response(
                 },
                 "strategy_used": selected.get("strategy_used", "unknown")
             }
+
+def _cleanup_recent_images():
+    """清理超过24小时的图片ID"""
+    now = time.time()
+    for image_id, timestamp in list(RECENT_IMAGES.items()):
+        if now - timestamp > 24 * 3600:  # 24小时
+            del RECENT_IMAGES[image_id]

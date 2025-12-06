@@ -18,7 +18,8 @@ from ..utils.pixiv_utils import (
     _build_search_strategies,
     _execute_search_strategy,
     _select_best_image,
-    _validate_and_build_response
+    _validate_and_build_response,
+    _cleanup_recent_images
 )
 from ..config.config import (
     PROXY,
@@ -50,37 +51,57 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     logger.info(f"搜索标签：{search_tag}")
     encoded_tag = urllib.parse.quote(search_tag)
     is_explicit_r18_request = _is_r18_request(tags)
-    # 2. 三阶段策略配置
+    # 2. 清理过期的近期图片ID
+    _cleanup_recent_images()
+    # 3. 三阶段策略配置
     strategies = _build_search_strategies()
-    # 3. 三阶段搜索重试
+    # 4. 三阶段搜索重试
     for strategy in strategies:
         for attempt in range(5):  # 每个策略最多尝试5次
             try:
-                # 4. 执行策略搜索
+                # 5. 执行策略搜索
                 results = await _execute_search_strategy(
                     search_tag, encoded_tag, strategy
                 )
-                filtered_results = [r for r in results if not _is_r18_content(_extract_tag_names(r)) or is_explicit_r18_request]
+                # 6. 修复：正确过滤近期图片和R-18内容
+                filtered_results = []
+                for r in results:
+                    # 检查图片ID是否在缓存中（如果缓存为空，跳过ID检查）
+                    if RECENT_IMAGES and 'illust_id' in r:
+                        image_id = str(r['illust_id'])
+                        if image_id in RECENT_IMAGES:
+                            continue  # 已缓存，跳过
+                    # 修复R-18过滤逻辑：非R-18请求时排除R-18内容
+                    if not is_explicit_r18_request and _is_r18_content(_extract_tag_names(r)):
+                        continue  # 非R-18请求时排除R-18内容
+                    filtered_results.append(r)
+                # 7. 处理结果
                 if not filtered_results and not is_explicit_r18_request:
                     # 非R-18请求但全是R-18内容，调整策略参数
                     logger.info(f"策略[{strategy['name']}]全是R-18内容，调整参数重试")
                     strategy["params"]["mode"] = "safe"  # 添加安全模式参数
                     continue  # 重试当前策略
-                # 5. 处理结果并选择作品
-                selected = _select_best_image(results, is_explicit_r18_request)
-                # 6. 获取作品详情并验证
-                return await _validate_and_build_response(
+                # 8. 处理结果并选择作品
+                selected = _select_best_image(filtered_results, is_explicit_r18_request)
+                # 9. 获取作品详情并验证
+                result = await _validate_and_build_response(
                     selected, is_explicit_r18_request, encoded_tag
                 )
+                # 10. 添加新图片ID到缓存
+                if selected and 'illust_id' in selected:
+                    image_id = str(selected['illust_id'])
+                    RECENT_IMAGES[image_id] = time.time()
+                    # 限制缓存大小
+                    if len(RECENT_IMAGES) > 500:
+                        oldest_id = min(RECENT_IMAGES, key=RECENT_IMAGES.get)
+                        del RECENT_IMAGES[oldest_id]
+                return result
             except Exception as e:
                 logger.warning(f"策略[{strategy['name']}]尝试#{attempt+1}失败: {str(e)}")
-                # 如果是最后一次尝试或最后一个策略且第二次尝试后仍失败，则退出当前策略循环
                 if attempt == 4 or (strategy is strategies[-1] and attempt >= 1):
                     break
-        # 如果是因为内部循环正常结束（未触发break），则继续下一个策略
         else:
             continue
-        # 因为break而退出，不再继续尝试其他策略
         break
     raise Exception("所有搜索策略均失败或搜索均命中限制级内容请重试")
 
