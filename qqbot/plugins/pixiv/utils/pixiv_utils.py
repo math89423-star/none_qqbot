@@ -124,32 +124,6 @@ def _is_r18_content(tag_names: list) -> bool:
     """检查R-18内容"""
     return any("r-18" in tag or "r18" in tag for tag in tag_names)
 
-# def _calculate_quality_scores(
-#     items: list,
-#     current_time: datetime
-# ) -> list:
-#     """计算作品质量评分（含新鲜度加成）"""
-#     scored_items = []
-#     for item in items:
-#         # 基础质量指标
-#         bookmark_count = item.get("bookmarkCount", 0)
-#         like_count = item.get("likeCount", 0)
-#         view_count = item.get("viewCount", 0)
-#         quality_score = (bookmark_count * 3 + like_count * 2 + view_count * 0.05)
-#         # 新鲜度加成
-#         if create_date := item.get("createDate"):
-#             try:
-#                 clean_date = create_date.split("T")[0]
-#                 create_time = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-#                 days_old = (current_time - create_time).days
-#                 freshness_factor = 1.5 if days_old <= 30 else 1.0
-#                 freshness_factor = max(0.3, 1 - (days_old / 365)) if days_old > 90 else freshness_factor
-#                 quality_score *= freshness_factor
-#             except Exception:
-#                 pass  # 跳过日期解析错误
-#         scored_items.append((quality_score, item))
-#     return scored_items
-
 def _calculate_quality_scores(
     items: list,
     current_time: datetime
@@ -295,7 +269,6 @@ async def _validate_and_build_response(
     illust_url = f"https://www.pixiv.net/ajax/illust/{illust_id}"
     headers = _build_pixiv_headers(encoded_tag)
     headers.update({"Referer": f"https://www.pixiv.net/artworks/{illust_id}"})
-
     async with aiohttp.ClientSession() as session, \
         session.get(
             illust_url,
@@ -305,16 +278,13 @@ async def _validate_and_build_response(
         ) as response:
             if response.status != HTTPStatus.OK:
                 raise Exception(f"获取作品详情失败: {response.status}")
-
             data = await response.json()
             if data.get("error"):
                 raise Exception(f"作品详情错误: {data.get('message', '未知错误')}")
-
             # 二次R-18验证
             work_tags = _extract_tag_names(data["body"])
             if not is_explicit_r18_request and (_is_r18_content(work_tags)):
                 raise Exception("检测到R-18内容但未明确请求")
-
             # 构建返回结果
             body = data["body"]
             return {
