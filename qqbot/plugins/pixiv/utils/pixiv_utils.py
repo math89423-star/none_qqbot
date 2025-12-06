@@ -3,6 +3,7 @@ import random
 import aiohttp
 import time
 import threading
+import math
 from http import HTTPStatus
 from datetime import datetime, timedelta, timezone
 from .error_utils import PixivAPIError
@@ -113,7 +114,6 @@ def _extract_tag_names(item: dict) -> list:
     tags_info = item.get("tags", [])
     if isinstance(tags_info, dict):
         tags_info = tags_info.get("tags", [])
-
     return [
         tag.get("tag", "").lower()
         for tag in tags_info
@@ -124,26 +124,83 @@ def _is_r18_content(tag_names: list) -> bool:
     """检查R-18内容"""
     return any("r-18" in tag or "r18" in tag for tag in tag_names)
 
+# def _calculate_quality_scores(
+#     items: list,
+#     current_time: datetime
+# ) -> list:
+#     """计算作品质量评分（含新鲜度加成）"""
+#     scored_items = []
+#     for item in items:
+#         # 基础质量指标
+#         bookmark_count = item.get("bookmarkCount", 0)
+#         like_count = item.get("likeCount", 0)
+#         view_count = item.get("viewCount", 0)
+#         quality_score = (bookmark_count * 3 + like_count * 2 + view_count * 0.05)
+#         # 新鲜度加成
+#         if create_date := item.get("createDate"):
+#             try:
+#                 clean_date = create_date.split("T")[0]
+#                 create_time = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+#                 days_old = (current_time - create_time).days
+#                 freshness_factor = 1.5 if days_old <= 30 else 1.0
+#                 freshness_factor = max(0.3, 1 - (days_old / 365)) if days_old > 90 else freshness_factor
+#                 quality_score *= freshness_factor
+#             except Exception:
+#                 pass  # 跳过日期解析错误
+#         scored_items.append((quality_score, item))
+#     return scored_items
+
 def _calculate_quality_scores(
     items: list,
     current_time: datetime
 ) -> list:
-    """计算作品质量评分（含新鲜度加成）"""
+    """计算作品质量评分（优化版：综合考虑绝对数量、互动比率和新鲜度）"""
     scored_items = []
     for item in items:
-        # 基础质量指标
-        bookmark_count = item.get("bookmarkCount", 0)
-        like_count = item.get("likeCount", 0)
-        view_count = item.get("viewCount", 0)
-        quality_score = (bookmark_count * 3 + like_count * 2 + view_count * 0.05)
-        # 新鲜度加成
+        # 基础指标
+        bookmark_count = item.get("bookmarkCount", 0)  # 收藏数
+        like_count = item.get("likeCount", 0)          # 点赞数
+        view_count = max(1, item.get("viewCount", 1))  # 浏览量，至少为1
+        # 1. 计算基础质量得分
+        # 1.1 绝对互动分（收藏权重更高，反映Pixiv平台特性）
+        absolute_score = bookmark_count * 5 + like_count * 3
+        # 1.2 比率分（高质量低曝光作品的补偿机制）
+        bookmark_ratio = bookmark_count / view_count
+        like_ratio = like_count / view_count
+        # 比率分：将互动比率转换为加分项（收藏率5%+和点赞率15%+被视为高质量）
+        ratio_score = 0
+        if bookmark_ratio > 0.05:  # 收藏率超过5%
+            ratio_score += (bookmark_ratio - 0.05) * 2000  # 每超过1%加20分
+        if like_ratio > 0.15:      # 点赞率超过15%
+            ratio_score += (like_ratio - 0.15) * 500       # 每超过1%加5分
+        # 1.3 高互动率作品额外加成（针对新作品或小众优质作品）
+        if view_count < 1000 and bookmark_ratio > 0.1:  # 低浏览但高收藏率
+            ratio_score *= 1.5
+        # 1.4 综合基础质量得分
+        quality_score = absolute_score + ratio_score
+        # 2. 新鲜度加成
         if create_date := item.get("createDate"):
             try:
                 clean_date = create_date.split("T")[0]
                 create_time = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
                 days_old = (current_time - create_time).days
-                freshness_factor = 1.5 if days_old <= 30 else 1.0
-                freshness_factor = max(0.3, 1 - (days_old / 365)) if days_old > 90 else freshness_factor
+                # 新鲜度因子（更平滑的衰减曲线）
+                if days_old <= 3:      # 3天内
+                    freshness_factor = 2.0
+                elif days_old <= 7:    # 一周内
+                    freshness_factor = 1.6
+                elif days_old <= 14:   # 两周内
+                    freshness_factor = 1.3
+                elif days_old <= 30:   # 一个月内
+                    freshness_factor = 1.15
+                elif days_old <= 60:   # 两个月内
+                    freshness_factor = 1.05
+                elif days_old <= 90:   # 三个月内
+                    freshness_factor = 1.0
+                else:
+                    # 90天以上，每多30天衰减0.05，最低0.5
+                    decay_factor = max(0, (days_old - 90) / 30) * 0.05
+                    freshness_factor = max(0.5, 1.0 - decay_factor)
                 quality_score *= freshness_factor
             except Exception:
                 pass  # 跳过日期解析错误
