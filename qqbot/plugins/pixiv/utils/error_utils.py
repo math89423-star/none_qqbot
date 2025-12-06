@@ -1,7 +1,7 @@
 class PixivAPIError(Exception):
     """Pixiv API 异常"""
     def __init__(
-            self, 
+            self,
             error_type: str,
             strategy_name: str,
             details: dict = None
