@@ -1,6 +1,7 @@
 import os
 import asyncio
 import traceback
+import configparser
 import time
 import logging
 import aiohttp
@@ -10,18 +11,30 @@ from nonebot import on_command, logger, get_driver
 from nonebot.adapters.onebot.v11 import MessageSegment, Bot, Event
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from .config.config import COOLDOWN_TIME, PROXY, PROXY_URL
 
 logger = logging.getLogger()
 logging.basicConfig(level = logging.INFO,format = '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+
 
 # 导入Pixiv逻辑
 from .pixiv import (
     search_pixiv_by_tag,
     download_original_image,
-    cleanup_temp_files
+    cleanup_temp_files,
+    COOLDOWN_TIME,
+    PROXY_URL
 )
 
+# 读取配置
+config_dir = os.path.dirname(os.path.abspath(__file__))
+config_path = os.path.join(config_dir, 'config.conf')
+config = configparser.ConfigParser()
+config.read(config_path)
+
+# 优先使用环境变量，其次使用默认值
+PROXY = config.get('DEFAULT', 'PROXY', fallback='http://127.0.0.1:7890')
+USE_PROXY = config.getboolean('DEFAULT', 'USE_PROXY', fallback=True)
 
 # 请求冷却机制
 last_request_time = {}  # {user_id: last_request_time}
@@ -30,7 +43,6 @@ last_request_time = {}  # {user_id: last_request_time}
 # ====== 新增：角色昵称数据加载 ======
 # 尝试加载角色数据文件
 character_data = {}
-config_dir = os.path.dirname(os.path.abspath(__file__))
 character_file = os.path.join(config_dir, 'character.json')
 if os.path.exists(character_file):
     try:
