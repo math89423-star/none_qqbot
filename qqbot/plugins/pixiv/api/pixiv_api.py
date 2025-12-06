@@ -50,12 +50,11 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
     logger.info(f"搜索标签：{search_tag}")
     encoded_tag = urllib.parse.quote(search_tag)
     is_explicit_r18_request = _is_r18_request(tags)
-    search_mode = "all" if is_explicit_r18_request else "safe"
     # 2. 三阶段策略配置
     strategies = _build_search_strategies()
     # 3. 三阶段搜索重试
     for strategy in strategies:
-        for attempt in range(3):  # 每个策略最多尝试3次
+        for attempt in range(5):  # 每个策略最多尝试5次
             try:
                 # 4. 执行策略搜索
                 results = await _execute_search_strategy(
@@ -75,11 +74,14 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 )
             except Exception as e:
                 logger.warning(f"策略[{strategy['name']}]尝试#{attempt+1}失败: {str(e)}")
-                if attempt == 1 or strategy is strategies[-1]:
+                # 完成5次尝试
+                if (attempt >= 4 or
+                        (strategy is strategies[-1] and attempt >= 1)):  # 最后一个策略时，在第二次失败后退出
                     break
-            if strategy is strategies[-1]:
-                raise Exception(f"所有搜索策略均失败: {str(e)}")
-    raise Exception("三阶段搜索全部失败")
+        else:  # 如果循环不是因为break结束，则继续下一个策略
+            continue
+        break  # 因为break而退出，不再继续尝试其他策略
+    raise Exception("所有搜索策略均失败或搜索均命中限制级内容请重试")
 
 async def get_remote_file_size(url: str) -> int:
     """获取远程文件大小，避免下载大文件"""
@@ -119,34 +121,71 @@ async def get_remote_file_size(url: str) -> int:
         return 0
 
 async def compress_image(file_path: Path, max_size: int = 10 * 1024 * 1024) -> Path:
-    """压缩图片，确保不超过指定大小（10MB）"""
+    """智能压缩图片，最大化利用10MB上限保持质量"""
     try:
-        # 读取图片
+        original_size = file_path.stat().st_size
+        if original_size <= max_size:
+            return file_path
+        logger.warning(f"⚠️ 图片过大 ({original_size/1024/1024:.2f}MB)，开始智能压缩...")
         with Image.open(file_path) as img:
-            # 获取原始尺寸
-            width, height = img.size
-            # 如果图片已经小于10MB，直接返回
-            if file_path.stat().st_size <= max_size:
-                return file_path
-            # 尝试压缩图片
-            quality = 95
-            while quality > 50 and file_path.stat().st_size > max_size:
-                # 保存压缩后的图片
-                buffer = io.BytesIO()
-                img.save(buffer, format="JPEG", quality=quality, optimize=True)
-                buffer.seek(0)
-                compressed_size = buffer.tell()
-                # 如果压缩后的大小符合要求，保存并返回
-                if compressed_size <= max_size:
-                    new_file_path = file_path.with_suffix('.jpg')
-                    with open(new_file_path, 'wb') as f:
-                        f.write(buffer.read())
-                    return new_file_path
-                quality -= 5
-            # 如果压缩到最低质量仍然太大，使用预览图
+            # 1. 预处理：转换为RGB（移除透明通道等）
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = background
+            # 2. 获取原始尺寸
+            orig_width, orig_height = img.size
+            max_dimension = 4096  # 最大允许尺寸
+            # 3. 判断是否需要调整尺寸
+            need_resize = max(orig_width, orig_height) > max_dimension
+            if need_resize:
+                ratio = max_dimension / max(orig_width, orig_height)
+                new_size = (int(orig_width * ratio), int(orig_height * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+                logger.info(f"📏 调整尺寸: {orig_width}x{orig_height} → {new_size[0]}x{new_size[1]}")
+            # 4. 尝试仅通过调整JPEG质量来压缩图片
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=95, optimize=True, progressive=True)
+            size_after_quality_adjustment = buffer.tell()
+            if size_after_quality_adjustment <= max_size:
+                logger.debug(f"🔍 单纯调整质量已满足要求: {size_after_quality_adjustment/1024/1024:.2f}MB")
+                compressed_size = size_after_quality_adjustment
+                best_buffer = buffer
+                best_quality = 95
+            else:
+                # 5. 使用二分查找法寻找最佳JPEG质量
+                low, high = 70, 98  # 合理质量范围
+                best_quality = 85  # 默认质量
+                best_buffer = None
+                target_size = max_size * 0.95
+                for _ in range(8):  # 最多8次迭代
+                    mid = (low + high) // 2
+                    buffer = io.BytesIO()
+                    img.save(buffer, format="JPEG", quality=mid, optimize=True, progressive=True)
+                    size = buffer.tell()
+                    logger.debug(f"🔍 质量测试: {mid}% → {size/1024/1024:.2f}MB")
+                    if size <= target_size:
+                        best_quality = mid
+                        best_buffer = buffer
+                        low = mid + 1  # 尝试更高品质
+                    else:
+                        high = mid - 1
+                compressed_size = best_buffer.tell()
+            # 6. 验证最终结果并保存
+            if best_buffer and compressed_size <= max_size:
+                new_file_path = file_path.with_name(f"{file_path.stem}_compressed.jpg")
+                with open(new_file_path, 'wb') as f:
+                    f.write(best_buffer.getvalue())
+                logger.info(
+                    f"✅ 压缩成功: {original_size/1024/1024:.2f}MB → "
+                    f"{compressed_size/1024/1024:.2f}MB "
+                    f"(质量: {best_quality}%, 尺寸: {img.size[0]}x{img.size[1]})"
+                )
+                return new_file_path
+            logger.warning("⚠️ 智能压缩未达目标，使用预览图替代")
             return None
     except Exception as e:
-        logger.error(f"图片压缩失败: {str(e)}")
+        logger.error(f"图片压缩失败: {str(e)}", exc_info=True)
         return None
 
 async def download_original_image(url: str) -> Path:
