@@ -33,7 +33,7 @@ if os.path.exists(character_file):
             character_data = json.load(f)
         logger.info(f"角色数据加载成功，共 {len(character_data)} 个角色")
     except Exception as e:
-        logger.error(f"加载角色数据失败: {str(e)}")
+        logger.info(f"加载角色数据失败: {str(e)}")
         character_data = {}  # 加载失败时清空数据
 else:
     logger.warning("角色数据文件 character.json 不存在，将使用空数据")
@@ -228,12 +228,12 @@ async def handle_help_command(bot: Bot, event: Event):
         # 验证归属是否存在
         if franchise not in character_data:
             # 尝试模糊匹配归属
-            matches = [f for f in character_data.keys() if franchise in f]
+            matches = [f for f in character_data if franchise in f]
             if matches:
                 msg = f"⚠️ 未找到归属「{franchise}」，您可能想查询:\n"
                 msg += "• " + "\n• ".join(f"「{m}」" for m in matches)
             else:
-                msg = f"❌ 未找到归属「{franchise}」\n可用归属: {', '.join(character_data.keys())}"
+                msg = f"❌ 未找到归属「{franchise}」\n可用归属: {', '.join(character_data)}"
             await bot.send(event, msg)
             return
         # 获取归属下的角色列表
@@ -248,7 +248,7 @@ async def handle_help_command(bot: Bot, event: Event):
     franchise, character = parts
     # 验证归属
     if franchise not in character_data:
-        matches = [f for f in character_data.keys() if franchise in f]
+        matches = [f for f in character_data if franchise in f]
         if matches:
             msg = f"⚠️ 归属「{franchise}」不存在，推荐:\n"
             msg += "• " + "\n• ".join(f"「{m}」" for m in matches)
@@ -260,7 +260,7 @@ async def handle_help_command(bot: Bot, event: Event):
     franchise_data = character_data[franchise]
     if character not in franchise_data:
         # 在归属内模糊匹配角色
-        matches = [c for c in franchise_data.keys() if character in c]
+        matches = [c for c in franchise_data if character in c]
         if matches:
             msg = f"🔍 在「{franchise}」中未找到「{character}」，推荐:\n"
             msg += "• " + "\n• ".join(matches)
