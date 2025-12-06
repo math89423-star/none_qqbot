@@ -92,7 +92,7 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                 selected = _select_best_image(filtered_results, is_explicit_r18_request)
                 # 9. 获取作品详情并验证
                 result = await _validate_and_build_response(
-                    selected, is_explicit_r18_request, encoded_tag
+                    selected, is_explicit_r18_request, [encoded_tag]
                 )
                 # 10. 添加新图片ID到缓存
                 if selected and 'illust_id' in selected:
@@ -104,15 +104,15 @@ async def search_pixiv_by_tag(tags: list, max_results=10) -> dict:
                     RECENT_IMAGES[image_id] = time.time()
                     # 限制缓存大小
                     if len(RECENT_IMAGES) > 500:
-                        oldest_id = min(RECENT_IMAGES, key=RECENT_IMAGES.get)
+                        oldest_id = min(RECENT_IMAGES.items(), key=lambda x: x[1])[0]
                         del RECENT_IMAGES[oldest_id]
                 return result
             except Exception as e:
                 logger.warning(f"策略[{strategy['name']}]尝试#{attempt+1}失败: {str(e)}")
                 if attempt == 7:
                     break
-        else:
-            continue
+                else:
+                    continue
     raise Exception("所有搜索策略均失败或搜索均命中限制级内容请重试")
 
 async def get_remote_file_size(url: str) -> int:
